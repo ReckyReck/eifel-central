@@ -1,11 +1,21 @@
 # Builds Eifel Mastering Central for Mac (Apple Silicon + Intel) and Windows (64-bit) on GitHub's computers.
 # Start it: github.com > eifel-central > Actions > "Build app" > Run workflow.
 # When it is finished (about 10-20 minutes), the downloads are at the bottom of the run's page, under "Artifacts".
+# If the Mac job waits forever ("capacity constraints"): Run workflow again and pick "Intel Mac" - GitHub is often
+# short of Apple Silicon Macs. The result is the same universal app (Apple Silicon + Intel).
 # (Later, step 9: a tag "central-vX.Y.Z" will also publish a release with the self-update files.)
 name: Build app
 
 on:
   workflow_dispatch:
+    inputs:
+      mac:
+        description: "Mac build computer"
+        type: choice
+        default: "Apple Silicon Mac (macos-15)"
+        options:
+          - "Apple Silicon Mac (macos-15)"
+          - "Intel Mac (macos-15-intel)"
 
 jobs:
   build:
@@ -17,7 +27,7 @@ jobs:
       matrix:
         include:
           - name: Mac (Apple Silicon + Intel)
-            os: macos-15
+            os: ${{ contains(inputs.mac, 'intel') && 'macos-15-intel' || 'macos-15' }}
             args: --target universal-apple-darwin --bundles app,dmg
             artifact: Eifel-Mastering-Central-Mac
             path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
