@@ -1,7 +1,7 @@
 {
   "name": "eifel-central",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Eifel Mastering Central - installs and updates Recky's plug-ins",
   "type": "module",
   "scripts": {

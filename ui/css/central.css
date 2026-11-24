@@ -180,3 +180,20 @@ input { font-family: inherit; user-select: text; -webkit-user-select: text; }
          padding: 11px 16px; border-radius: 4px; font-size: 12.5px; color: var(--label); background: #111112; box-shadow: 0 0 0 1px #3a3a3b, 0 6px 20px rgba(0,0,0,.6);
          animation: toast-in .18s ease-out; }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 6px); } }
+
+/* ---- install progress: LED chain like the plug-ins' meters (step 6) ------------------------------------------- */
+.status-job { flex-direction: column; align-items: flex-start; gap: 7px; }
+.status-job .bad { color: var(--led-red); }
+.status-job .note { font-size: 10.5px; font-weight: 500; letter-spacing: .02em; text-transform: none; }
+.led-chain { display: flex; gap: 3px; padding: 4px 5px; border-radius: 3px; background: #050505;
+             box-shadow: inset 0 1px 3px rgba(0,0,0,.9), 0 1px 0 rgba(255,255,255,.06); }
+.led-chain .led { width: 9px; height: 9px; }
+.led.blink { animation: led-blink 1s steps(2, start) infinite; }
+@keyframes led-blink { to { visibility: hidden; } }
+
+/* ---- "Replace?" dialog ------------------------------------------------------------------------------------------ */
+.confirm { width: 600px; }
+.confirm p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--label); }
+.confirm .warn { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 4px; background: #2a2114;
+                 box-shadow: inset 0 0 0 1px #5a431d; }
+.confirm .warn .led { margin-top: 3px; }

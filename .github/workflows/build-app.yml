@@ -3,7 +3,10 @@
 # When it is finished (about 10-20 minutes), the downloads are at the bottom of the run's page, under "Artifacts".
 # If the Mac job waits forever ("capacity constraints"): Run workflow again and pick "Intel Mac" - GitHub is often
 # short of Apple Silicon Macs. The result is the same universal app (Apple Silicon + Intel).
-# (Later, step 9: a tag "central-vX.Y.Z" will also publish a release with the self-update files.)
+# Tick "Publish a test release" to put the Mac app on github.com/ReckyReck/eifel-central/releases as a pre-release
+# "central-vX.Y.Z" (X.Y.Z = version in src-tauri/tauri.conf.json): testers download it there without a GitHub account.
+# A version can be published only once - raise the version for the next test build.
+# (Later, step 9: releases will also carry the self-update files.)
 name: Build app
 
 on:
@@ -16,6 +19,10 @@ on:
         options:
           - "Apple Silicon Mac (macos-15)"
           - "Intel Mac (macos-15-intel)"
+      publish:
+        description: "Publish a test release (Mac app, pre-release) for testers"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -73,8 +80,51 @@ jobs:
           fi
           echo "Mac app OK"
 
+      - name: Test the installer (offline tests + download and unpack every Mac plug-in of the live catalog, no install)
+        if: runner.os == 'macOS'
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --include-ignored --nocapture
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
           if-no-files-found: error
+
+  release:
+    name: Publish test release
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Eifel-Mastering-Central-Mac
+          path: dist
+
+      - name: Create the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(python3 -c 'import json;print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          TAG="central-v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG is already published. Raise the version (tauri.conf.json, Cargo.toml, package.json) and build again."
+            exit 1
+          fi
+          cat > notes.md <<NOTES
+          Test build of Eifel Mastering Central $VERSION (alpha) for Mac (Apple Silicon and Intel).
+
+          **First start**
+          1. Download the .dmg below, open it and drag **Eifel Mastering Central** into **Applications**.
+          2. Open the app. macOS says it cannot check it: click **Done**.
+          3. System Settings > Privacy & Security: scroll down, click **Open Anyway** next to Eifel Mastering Central, enter your password.
+
+          See the README for what this build can do.
+          NOTES
+          gh release create "$TAG" dist/*.dmg --prerelease --target "$GITHUB_SHA" \
+            --title "Eifel Mastering Central $VERSION (test)" --notes-file notes.md
+          echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"

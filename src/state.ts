@@ -72,11 +72,15 @@ export interface InstalledEntry {
   formats: Format[];
   /** Installed by Central (listed in installed.json) or found on disk from another installer. */
   byCentral: boolean;
+  /** Where the copy that counts is: system folder or the user's own. */
+  location: "system" | "user" | null;
+  /** Every copy found on disk. */
+  paths: string[];
 }
 
 /**
- * What is installed, by plug-in id. Comes from the app's Rust side ("get_installed", reads installed.json and the
- * bundles' Info.plist / moduleinfo.json) - that command arrives with installing in step 6. Until then: nothing.
+ * What is installed, by plug-in id. Comes from the app's Rust side ("get_installed": reads installed.json and the
+ * bundles' Info.plist in /Library/Audio/Plug-Ins and ~/Library/Audio/Plug-Ins). Outside the app: nothing.
  */
 export async function loadInstalled(catalog: Plugin[]): Promise<Map<string, InstalledEntry>> {
   const invoke = window.__TAURI__?.core.invoke;
@@ -85,7 +89,12 @@ export async function loadInstalled(catalog: Plugin[]): Promise<Map<string, Inst
     const list = await invoke<Array<{ id: string } & InstalledEntry>>("get_installed", {
       plugins: catalog.map((p) => ({ id: p.id, bundleNames: p.bundleNames, bundleId: p.bundleId ?? null })),
     });
-    return new Map(list.map((e) => [e.id, { version: e.version, formats: e.formats, byCentral: e.byCentral }]));
+    return new Map(
+      list.map((e) => [
+        e.id,
+        { version: e.version, formats: e.formats, byCentral: e.byCentral, location: e.location ?? null, paths: e.paths ?? [] },
+      ]),
+    );
   } catch {
     return new Map();
   }

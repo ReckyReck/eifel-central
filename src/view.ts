@@ -4,6 +4,8 @@ import type { LoadResult } from "./catalog.js";
 import { CATALOG_URL } from "./catalog.js";
 import { display, h, led, screws, sectionLine } from "./dom.js";
 import { t } from "./i18n/index.js";
+import type { Job } from "./install.js";
+import { formatsToInstall } from "./install.js";
 import type { PluginView, Settings } from "./state.js";
 import { FORMATS_FOR_PLATFORM, PLATFORM } from "./state.js";
 
@@ -18,6 +20,10 @@ export interface ViewState {
   settingsOpen: boolean;
   appVersion: string;
   now: number;
+  /** the running (or last finished) install */
+  job: Job | null;
+  /** plug-in waiting for "Replace?" to be answered */
+  confirm: PluginView | null;
 }
 
 export interface Actions {
@@ -27,6 +33,9 @@ export interface Actions {
   changeSettings(s: Settings): void;
   retry(): void;
   notYet(): void;
+  install(v: PluginView): void;
+  cancelInstall(): void;
+  answerReplace(ok: boolean): void;
 }
 
 // ---- helpers ------------------------------------------------------------------------------------------------------
@@ -158,7 +167,55 @@ function versions(v: PluginView): HTMLElement {
   return h("div", { class: "versions" }, h("span", { class: "tiny-label" }, t("unit.available")), h("div", { class: "version-row" }, display(latest)));
 }
 
-function status(v: PluginView): HTMLElement {
+const CHAIN = 12;
+const RUNNING: Job["phase"][] = ["download", "verify", "unpack", "password", "copy"];
+const isRunning = (j: Job | null): boolean => !!j && RUNNING.includes(j.phase);
+
+/** LED chain like the plug-ins' meters: lights up from the left as the install goes on. */
+function ledChain(job: Job): HTMLElement {
+  const lit = Math.round(job.fraction * CHAIN);
+  const color = job.phase === "error" ? "red" : job.phase === "done" ? "green" : "amber";
+  const leds = Array.from({ length: CHAIN }, (_, i) => {
+    const on = i < lit;
+    const blink = job.phase === "password" && i === lit - 1;
+    return led(on ? color : "off", blink ? "blink" : "");
+  });
+  return h("div", { class: "led-chain", role: "progressbar", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.round(job.fraction * 100) }, ...leds);
+}
+
+function phaseText(job: Job): string {
+  switch (job.phase) {
+    case "download":
+      return t("phase.download", { percent: job.total ? Math.floor((100 * job.done) / job.total) : 0 });
+    case "verify":
+      return t("phase.verify");
+    case "unpack":
+      return t("phase.unpack");
+    case "password":
+      return t("phase.password");
+    case "copy":
+      return t("phase.copy");
+    case "done":
+      return t("phase.done");
+    case "error":
+      return t("status.failed");
+  }
+}
+
+function jobStatus(job: Job): HTMLElement {
+  return h(
+    "div",
+    { class: "status status-job", title: job.message },
+    ledChain(job),
+    h("span", { class: job.phase === "error" ? "bad" : "" }, phaseText(job)),
+    job.phase === "done" ? h("span", { class: "note" }, t("phase.dawNote")) : null,
+  );
+}
+
+function status(v: PluginView, job: Job | null): HTMLElement {
+  if (job && job.id === v.plugin.id) return jobStatus(job);
+  if (v.installed && !v.installed.byCentral)
+    return h("div", { class: "status" }, led("amber"), h("span", {}, t("status.notByCentral")));
   const [color, text]: ["green" | "amber" | "red" | "off", string] =
     v.status === "update"
       ? ["amber", t("status.updateReady")]
@@ -170,14 +227,20 @@ function status(v: PluginView): HTMLElement {
   return h("div", { class: "status" }, led(color), h("span", {}, text), v.isNew ? h("span", { class: "badge-new" }, t("status.new")) : null);
 }
 
-function actionButton(v: PluginView, a: Actions): HTMLElement {
+function actionButton(v: PluginView, a: Actions, job: Job | null): HTMLElement {
+  if (job && job.id === v.plugin.id && isRunning(job)) {
+    const canCancel = job.phase === "download" || job.phase === "verify" || job.phase === "unpack";
+    return canCancel ? button(t("button.cancel"), "secondary", a.cancelInstall) : button(t("button.installing"), "secondary", undefined, true);
+  }
+  const busy = isRunning(job);
+  if (v.installed && !v.installed.byCentral) return button(t("button.replace"), "secondary", () => a.install(v), busy);
   if (v.status === "update") return button(t("button.update"), "primary", a.notYet);
   if (v.status === "current") return button(t("button.options"), "secondary", a.notYet);
   if (v.status === "unavailable") return button(t("button.install"), "unlit", undefined, true);
-  return button(t("button.install"), "unlit", a.notYet);
+  return button(t("button.install"), "unlit", () => a.install(v), busy);
 }
 
-function rackUnit(v: PluginView, a: Actions): HTMLElement {
+function rackUnit(v: PluginView, a: Actions, job: Job | null): HTMLElement {
   return h(
     "article",
     { class: "panel brushed unit", "data-id": v.plugin.id },
@@ -185,8 +248,8 @@ function rackUnit(v: PluginView, a: Actions): HTMLElement {
     faceplate(v),
     h("div", { class: "unit-info" }, pluginTitle(v.plugin.name), h("div", { class: "tagline" }, v.plugin.tagline), formatLeds(v)),
     versions(v),
-    status(v),
-    h("div", { class: "unit-action" }, actionButton(v, a)),
+    status(v, job),
+    h("div", { class: "unit-action" }, actionButton(v, a, job)),
   );
 }
 
@@ -206,7 +269,7 @@ function list(s: ViewState, a: Actions): HTMLElement {
   const shown = s.views.filter((v) => matches(v, s.filter, s.search));
   if (!s.views.length) return h("main", { class: "list" }, h("div", { class: "empty" }, t("list.empty.catalog")));
   if (!shown.length) return h("main", { class: "list" }, h("div", { class: "empty" }, t("list.empty.filter")));
-  return h("main", { class: "list" }, ...shown.map((v) => rackUnit(v, a)));
+  return h("main", { class: "list" }, ...shown.map((v) => rackUnit(v, a, s.job)));
 }
 
 function footer(s: ViewState): HTMLElement {
@@ -300,14 +363,46 @@ function settingsPanel(s: ViewState, a: Actions): HTMLElement | null {
   );
 }
 
+// ---- "Replace?" ---------------------------------------------------------------------------------------------------
+function replacePanel(s: ViewState, a: Actions): HTMLElement | null {
+  const v = s.confirm;
+  if (!v || !v.installed) return null;
+  const p = v.plugin;
+  const formats = formatsToInstall(p, s.settings).map((f) => f.toUpperCase()).join(", ");
+  const location = t(s.settings.location === "user" ? "location.user" : "location.system");
+  const found = v.installed.location;
+  const elsewhere = found !== null && found !== s.settings.location;
+  const cancel = () => a.answerReplace(false);
+  return h(
+    "div",
+    { class: "modal-backdrop", onclick: (e: Event) => e.target === e.currentTarget && cancel() },
+    h(
+      "section",
+      { class: "panel brushed modal confirm", role: "alertdialog", "aria-modal": "true", "aria-label": t("replace.title", { name: p.name }) },
+      ...screws(),
+      h("h2", { class: "modal-title" }, t("replace.title", { name: p.name })),
+      h("p", {}, t("replace.found", { name: p.name, version: v.installed.version })),
+      h("p", {}, t("replace.will", { version: p.latest.version, formats, location })),
+      elsewhere ? h("p", { class: "warn" }, led("amber"), h("span", {}, t("replace.otherPlace", { found: t(found === "user" ? "location.user" : "location.system"), location }))) : null,
+      h(
+        "div",
+        { class: "row modal-foot" },
+        h("span", { class: "spacer" }),
+        button(t("replace.cancel"), "secondary", cancel),
+        button(t("replace.ok"), "primary", () => a.answerReplace(true)),
+      ),
+    ),
+  );
+}
+
 // ---- toast --------------------------------------------------------------------------------------------------------
 let toastTimer: number | undefined;
-export function toast(text: string): void {
+export function toast(text: string, color: "green" | "amber" | "red" = "amber", ms = 4500): void {
   document.querySelector(".toast")?.remove();
-  const el = h("div", { class: "toast", role: "status" }, led("amber"), h("span", {}, text));
+  const el = h("div", { class: "toast", role: "status" }, led(color), h("span", {}, text));
   document.body.append(el);
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => el.remove(), 4500);
+  toastTimer = window.setTimeout(() => el.remove(), ms);
 }
 
 // ---- whole window -------------------------------------------------------------------------------------------------
@@ -319,7 +414,7 @@ export function render(root: HTMLElement, s: ViewState, a: Actions): void {
   const scroll = root.querySelector(".list")?.scrollTop ?? 0;
 
   root.replaceChildren(header(s, a), filterBar(s, a), banner(s, a) ?? "", list(s, a), footer(s));
-  const modal = settingsPanel(s, a);
+  const modal = settingsPanel(s, a) ?? replacePanel(s, a);
   if (modal) root.append(modal);
 
   const listEl = root.querySelector(".list");
