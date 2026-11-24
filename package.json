@@ -1,0 +1,16 @@
+{
+  "name": "eifel-central",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Eifel Mastering Central - installs and updates Recky's plug-ins",
+  "type": "module",
+  "scripts": {
+    "build:ui": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^5.6"
+  }
+}
