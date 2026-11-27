@@ -4,12 +4,20 @@ import type { LoadResult } from "./catalog.js";
 import { CATALOG_URL } from "./catalog.js";
 import { display, h, led, screws, sectionLine } from "./dom.js";
 import { t } from "./i18n/index.js";
+import type { FeedbackKind } from "./feedback.js";
 import type { Job } from "./install.js";
-import { formatsToInstall } from "./install.js";
+import { formatsToInstall, targetOf } from "./install.js";
 import type { PluginView, Settings } from "./state.js";
 import { FORMATS_FOR_PLATFORM, PLATFORM } from "./state.js";
 
 export type Filter = "all" | "installed" | "updates" | "new";
+
+/** The dialog that is open (only one at a time). */
+export type Dialog =
+  | { kind: "replace"; view: PluginView }
+  | { kind: "update"; views: PluginView[]; mode: "update" | "reinstall" }
+  | { kind: "whatsNew"; view: PluginView }
+  | { kind: "remove"; views: PluginView[]; all: boolean };
 
 export interface ViewState {
   load: LoadResult | null;
@@ -20,10 +28,13 @@ export interface ViewState {
   settingsOpen: boolean;
   appVersion: string;
   now: number;
-  /** the running (or last finished) install */
-  job: Job | null;
-  /** plug-in waiting for "Replace?" to be answered */
-  confirm: PluginView | null;
+  /** the running (or last finished) install / remove, by plug-in id */
+  jobs: Record<string, Job>;
+  dialog: Dialog | null;
+  /** open drop-down menu: "feedback" or a plug-in id */
+  menu: string | null;
+  /** open DAWs (null = unknown, e.g. outside the app) */
+  daws: string[] | null;
 }
 
 export interface Actions {
@@ -32,10 +43,19 @@ export interface Actions {
   openSettings(open: boolean): void;
   changeSettings(s: Settings): void;
   retry(): void;
-  notYet(): void;
   install(v: PluginView): void;
+  update(v: PluginView): void;
+  updateAll(): void;
+  reinstall(v: PluginView): void;
+  whatsNew(v: PluginView): void;
+  remove(v: PluginView): void;
+  uninstallAll(): void;
+  /** OK (true) or Cancel (false) in the open dialog */
+  answer(ok: boolean): void;
   cancelInstall(): void;
-  answerReplace(ok: boolean): void;
+  toggleMenu(id: string | null): void;
+  /** without a plug-in: about Central itself */
+  feedback(kind: FeedbackKind, v?: PluginView): void;
 }
 
 // ---- helpers ------------------------------------------------------------------------------------------------------
@@ -74,7 +94,7 @@ function pluginTitle(name: string): HTMLElement {
     : h("h2", { class: "unit-name" }, h("b", {}, name.toUpperCase()));
 }
 
-function button(label: string, kind: "primary" | "secondary" | "unlit" | "danger", onclick?: () => void, disabled = false) {
+function button(label: string, kind: "primary" | "secondary" | "unlit" | "danger", onclick?: () => void, disabled = false): HTMLButtonElement {
   return h("button", { class: `btn btn-${kind}`, type: "button", disabled, onclick: onclick ? () => onclick() : undefined }, label);
 }
 
@@ -93,8 +113,20 @@ function header(s: ViewState, a: Actions): HTMLElement {
     h(
       "div",
       { class: "head-right" },
+      menuWrap(
+        s,
+        a,
+        "feedback",
+        button(t("header.feedback"), "unlit", () => a.toggleMenu(s.menu === "feedback" ? null : "feedback")),
+        [
+          { label: t("feedback.aboutCentral"), heading: true },
+          { label: t("feedback.bug"), run: () => a.feedback("bug") },
+          { label: t("feedback.feature"), run: () => a.feedback("feature") },
+          { label: t("feedback.idea"), run: () => a.feedback("idea") },
+        ],
+      ),
       h("div", { class: "labelled" }, h("span", { class: "tiny-label" }, t("header.updates")), display(t("header.ready", { n }), n ? "amber" : "dim")),
-      button(t("header.updateAll"), n ? "primary" : "secondary", a.notYet, n === 0),
+      button(t("header.updateAll"), n ? "primary" : "secondary", a.updateAll, n === 0 || anyRunning(s.jobs)),
       h("button", { class: "btn-round", type: "button", title: t("header.settings"), "aria-label": t("header.settings"), onclick: () => a.openSettings(true) }, gear()),
     ),
   );
@@ -168,8 +200,52 @@ function versions(v: PluginView): HTMLElement {
 }
 
 const CHAIN = 12;
-const RUNNING: Job["phase"][] = ["download", "verify", "unpack", "password", "copy"];
-const isRunning = (j: Job | null): boolean => !!j && RUNNING.includes(j.phase);
+const RUNNING: Job["phase"][] = ["queued", "download", "verify", "unpack", "password", "copy", "remove"];
+const isRunning = (j: Job | null | undefined): boolean => !!j && RUNNING.includes(j.phase);
+export const anyRunning = (jobs: Record<string, Job>): boolean => Object.values(jobs).some(isRunning);
+
+// ---- drop-down menus (OPTIONS ▾, SEND FEEDBACK ▾) -----------------------------------------------------------------
+interface MenuItem {
+  label: string;
+  run?: () => void;
+  disabled?: boolean;
+  /** a small heading line, not clickable */
+  heading?: boolean;
+  /** a fine line above this item */
+  separator?: boolean;
+}
+
+function menuWrap(s: ViewState, a: Actions, id: string, toggle: HTMLElement, items: MenuItem[]): HTMLElement {
+  const open = s.menu === id;
+  toggle.setAttribute("aria-haspopup", "menu");
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  const menu = open
+    ? h(
+        "div",
+        { class: "menu", role: "menu" },
+        ...items.flatMap((it) => [
+          it.separator ? h("div", { class: "menu-sep", role: "separator" }) : null,
+          it.heading
+            ? h("div", { class: "menu-heading" }, it.label)
+            : h(
+                "button",
+                {
+                  class: "menu-item",
+                  type: "button",
+                  role: "menuitem",
+                  disabled: !!it.disabled,
+                  onclick: () => {
+                    a.toggleMenu(null);
+                    it.run?.();
+                  },
+                },
+                it.label,
+              ),
+        ]),
+      )
+    : null;
+  return h("div", { class: `menu-wrap ${open ? "open" : ""}`, "data-menu": id }, toggle, menu);
+}
 
 /** LED chain like the plug-ins' meters: lights up from the left as the install goes on. */
 function ledChain(job: Job): HTMLElement {
@@ -195,6 +271,10 @@ function phaseText(job: Job): string {
       return t(PLATFORM === "windows" ? "phase.passwordWin" : "phase.password");
     case "copy":
       return t("phase.copy");
+    case "queued":
+      return t("phase.queued");
+    case "remove":
+      return t("phase.remove");
     case "done":
       return t("phase.done");
     case "error":
@@ -212,8 +292,8 @@ function jobStatus(job: Job): HTMLElement {
   );
 }
 
-function status(v: PluginView, job: Job | null): HTMLElement {
-  if (job && job.id === v.plugin.id) return jobStatus(job);
+function status(v: PluginView, job: Job | undefined): HTMLElement {
+  if (job) return jobStatus(job);
   if (v.installed && !v.installed.byCentral)
     return h("div", { class: "status" }, led("amber"), h("span", {}, t("status.notByCentral")));
   const [color, text]: ["green" | "amber" | "red" | "off", string] =
@@ -227,20 +307,38 @@ function status(v: PluginView, job: Job | null): HTMLElement {
   return h("div", { class: "status" }, led(color), h("span", {}, text), v.isNew ? h("span", { class: "badge-new" }, t("status.new")) : null);
 }
 
-function actionButton(v: PluginView, a: Actions, job: Job | null): HTMLElement {
-  if (job && job.id === v.plugin.id && isRunning(job)) {
-    const canCancel = job.phase === "download" || job.phase === "verify" || job.phase === "unpack";
-    return canCancel ? button(t("button.cancel"), "secondary", a.cancelInstall) : button(t("button.installing"), "secondary", undefined, true);
-  }
-  const busy = isRunning(job);
-  if (v.installed && !v.installed.byCentral) return button(t("button.replace"), "secondary", () => a.install(v), busy);
-  if (v.status === "update") return button(t("button.update"), "primary", a.notYet);
-  if (v.status === "current") return button(t("button.options"), "secondary", a.notYet);
-  if (v.status === "unavailable") return button(t("button.install"), "unlit", undefined, true);
-  return button(t("button.install"), "unlit", () => a.install(v), busy);
+function optionsMenu(v: PluginView, s: ViewState, a: Actions, main: boolean): HTMLElement {
+  const busy = anyRunning(s.jobs);
+  const inst = v.installed;
+  const items: MenuItem[] = [];
+  if (v.plugin.latest.changelog.length) items.push({ label: t("options.whatsNew", { version: v.plugin.latest.version }), run: () => a.whatsNew(v) });
+  if (inst && inst.byCentral) items.push({ label: t("options.reinstall"), run: () => a.reinstall(v), disabled: busy || v.status === "unavailable" });
+  if (inst) items.push({ label: t("options.remove"), run: () => a.remove(v), disabled: busy });
+  items.push({ label: t("options.bug"), run: () => a.feedback("bug", v), separator: items.length > 0 });
+  items.push({ label: t("options.feature"), run: () => a.feedback("feature", v) });
+  const toggle = button(t("button.options"), "secondary", () => a.toggleMenu(s.menu === v.plugin.id ? null : v.plugin.id));
+  if (!main) toggle.classList.add("btn-small");
+  return menuWrap(s, a, v.plugin.id, toggle, items);
 }
 
-function rackUnit(v: PluginView, a: Actions, job: Job | null): HTMLElement {
+function actions(v: PluginView, s: ViewState, a: Actions): HTMLElement[] {
+  const job = s.jobs[v.plugin.id];
+  if (isRunning(job)) {
+    const canCancel = job!.phase === "queued" || job!.phase === "download" || job!.phase === "verify" || job!.phase === "unpack";
+    if (job!.phase === "remove") return [button(t("button.removing"), "secondary", undefined, true)];
+    return [canCancel ? button(t("button.cancel"), "secondary", a.cancelInstall) : button(t("button.installing"), "secondary", undefined, true)];
+  }
+  const busy = anyRunning(s.jobs);
+  if (v.status === "current" && v.installed?.byCentral) return [optionsMenu(v, s, a, true)];
+  let main: HTMLElement;
+  if (v.installed && !v.installed.byCentral) main = button(t("button.replace"), "secondary", () => a.install(v), busy || v.status === "unavailable");
+  else if (v.status === "update") main = button(t("button.update"), "primary", () => a.update(v), busy);
+  else if (v.status === "unavailable") main = button(t("button.install"), "unlit", undefined, true);
+  else main = button(t("button.install"), "unlit", () => a.install(v), busy);
+  return [main, optionsMenu(v, s, a, false)];
+}
+
+function rackUnit(v: PluginView, s: ViewState, a: Actions): HTMLElement {
   return h(
     "article",
     { class: "panel brushed unit", "data-id": v.plugin.id },
@@ -248,8 +346,8 @@ function rackUnit(v: PluginView, a: Actions, job: Job | null): HTMLElement {
     faceplate(v),
     h("div", { class: "unit-info" }, pluginTitle(v.plugin.name), h("div", { class: "tagline" }, v.plugin.tagline), formatLeds(v)),
     versions(v),
-    status(v, job),
-    h("div", { class: "unit-action" }, actionButton(v, a, job)),
+    status(v, s.jobs[v.plugin.id]),
+    h("div", { class: "unit-action" }, ...actions(v, s, a)),
   );
 }
 
@@ -269,7 +367,7 @@ function list(s: ViewState, a: Actions): HTMLElement {
   const shown = s.views.filter((v) => matches(v, s.filter, s.search));
   if (!s.views.length) return h("main", { class: "list" }, h("div", { class: "empty" }, t("list.empty.catalog")));
   if (!shown.length) return h("main", { class: "list" }, h("div", { class: "empty" }, t("list.empty.filter")));
-  return h("main", { class: "list" }, ...shown.map((v) => rackUnit(v, a, s.job)));
+  return h("main", { class: "list" }, ...shown.map((v) => rackUnit(v, s, a)));
 }
 
 function footer(s: ViewState): HTMLElement {
@@ -286,7 +384,11 @@ function footer(s: ViewState): HTMLElement {
     "footer",
     { class: "foot" },
     h("span", { class: "foot-item" }, ...cat),
-    h("span", { class: "foot-item" }, led("off"), t("footer.dawInactive")),
+    s.daws === null
+      ? h("span", { class: "foot-item" }, led("off"), t("footer.dawUnknown"))
+      : s.daws.length
+        ? h("span", { class: "foot-item foot-daw" }, led("amber"), t("footer.dawOpen", { names: s.daws.join(", ") }))
+        : h("span", { class: "foot-item" }, led("green"), t("footer.dawNone")),
     h("span", { class: "foot-version" }, t("footer.version", { version: s.appVersion })),
   );
 }
@@ -312,6 +414,7 @@ function settingsPanel(s: ViewState, a: Actions): HTMLElement | null {
   const loc = (value: Settings["location"], label: string) =>
     h("button", { class: `seg ${st.location === value ? "on" : ""}`, type: "button", onclick: () => a.changeSettings({ ...st, location: value }) }, label);
   const reachable = s.load?.kind === "ok";
+  const anyInstalled = s.views.some((v) => v.installed);
 
   const close = () => a.openSettings(false);
   return h(
@@ -348,8 +451,13 @@ function settingsPanel(s: ViewState, a: Actions): HTMLElement | null {
       h(
         "div",
         { class: "row" },
-        h("button", { class: "btn btn-secondary btn-led", type: "button", onclick: () => a.notYet() }, led("red"), t("settings.uninstallAll")),
-        h("span", { class: "note" }, t("settings.uninstallNote")),
+        h(
+          "button",
+          { class: "btn btn-secondary btn-led", type: "button", disabled: !anyInstalled || anyRunning(s.jobs), onclick: () => a.uninstallAll() },
+          led(anyInstalled ? "red" : "off"),
+          t("settings.uninstallAll"),
+        ),
+        h("span", { class: "note" }, anyInstalled ? t(PLATFORM === "windows" ? "settings.uninstallNoteWin" : "settings.uninstallNote") : t("settings.nothingInstalled")),
       ),
       h(
         "div",
@@ -363,37 +471,165 @@ function settingsPanel(s: ViewState, a: Actions): HTMLElement | null {
   );
 }
 
-// ---- "Replace?" ---------------------------------------------------------------------------------------------------
-function replacePanel(s: ViewState, a: Actions): HTMLElement | null {
-  const v = s.confirm;
-  if (!v || !v.installed) return null;
-  const p = v.plugin;
-  const formats = formatsToInstall(p, s.settings).map((f) => f.toUpperCase()).join(", ");
-  const where = (l: Settings["location"]) => t(`location.${l}${PLATFORM === "windows" ? "Win" : ""}` as const);
-  const location = where(s.settings.location);
-  const found = v.installed.location;
-  const elsewhere = found !== null && found !== s.settings.location;
-  const cancel = () => a.answerReplace(false);
+// ---- dialogs ------------------------------------------------------------------------------------------------------
+function dawWarning(s: ViewState): HTMLElement | null {
+  if (!s.daws || !s.daws.length) return null;
+  const names = s.daws.join(", ");
+  return h("p", { class: "warn" }, led("amber"), h("span", {}, t(PLATFORM === "windows" ? "daw.warnWin" : "daw.warnMac", { names })));
+}
+
+function dialogFrame(title: string, a: Actions, body: Array<HTMLElement | null>, okLabel: string | null, okKind: "primary" | "danger" = "primary", cancelLabel = t("update.cancel")): HTMLElement {
+  const cancel = () => a.answer(false);
   return h(
     "div",
     { class: "modal-backdrop", onclick: (e: Event) => e.target === e.currentTarget && cancel() },
     h(
       "section",
-      { class: "panel brushed modal confirm", role: "alertdialog", "aria-modal": "true", "aria-label": t("replace.title", { name: p.name }) },
+      { class: "panel brushed modal confirm", role: "alertdialog", "aria-modal": "true", "aria-label": title },
       ...screws(),
-      h("h2", { class: "modal-title" }, t("replace.title", { name: p.name })),
-      h("p", {}, t("replace.found", { name: p.name, version: v.installed.version })),
-      h("p", {}, t("replace.will", { version: p.latest.version, formats, location })),
-      elsewhere ? h("p", { class: "warn" }, led("amber"), h("span", {}, t("replace.otherPlace", { found: where(found ?? "system"), location }))) : null,
+      h("h2", { class: "modal-title" }, title),
+      ...body,
       h(
         "div",
         { class: "row modal-foot" },
         h("span", { class: "spacer" }),
-        button(t("replace.cancel"), "secondary", cancel),
-        button(t("replace.ok"), "primary", () => a.answerReplace(true)),
+        button(cancelLabel, "secondary", cancel),
+        okLabel ? button(okLabel, okKind, () => a.answer(true)) : null,
       ),
     ),
   );
+}
+
+const where = (l: Settings["location"]) => t(`location.${l}${PLATFORM === "windows" ? "Win" : ""}` as const);
+
+function replaceDialog(s: ViewState, a: Actions, v: PluginView): HTMLElement | null {
+  if (!v.installed) return null;
+  const p = v.plugin;
+  const formats = formatsToInstall(p, s.settings).map((f) => f.toUpperCase()).join(", ");
+  const location = where(s.settings.location);
+  const found = v.installed.location;
+  const elsewhere = found !== null && found !== s.settings.location;
+  return dialogFrame(
+    t("replace.title", { name: p.name }),
+    a,
+    [
+      h("p", {}, t("replace.found", { name: p.name, version: v.installed.version })),
+      h("p", {}, t("replace.will", { version: p.latest.version, formats, location })),
+      elsewhere ? h("p", { class: "warn" }, led("amber"), h("span", {}, t("replace.otherPlace", { found: where(found ?? "system"), location }))) : null,
+      dawWarning(s),
+    ],
+    t("replace.ok"),
+    "primary",
+    t("replace.cancel"),
+  );
+}
+
+/** Changelog lines of the catalog's newest version, at most `max`. */
+function notes(v: PluginView, max: number): HTMLElement {
+  const lines = v.plugin.latest.changelog;
+  if (!lines.length) return h("p", { class: "note" }, t("update.noNotes"));
+  const shown = lines.slice(0, max);
+  return h(
+    "ul",
+    { class: "notes" },
+    ...shown.map((l) => h("li", {}, l)),
+    lines.length > shown.length ? h("li", { class: "note" }, t("update.more", { n: lines.length - shown.length })) : null,
+  );
+}
+
+function updateDialog(s: ViewState, a: Actions, views: PluginView[], mode: "update" | "reinstall"): HTMLElement {
+  const many = views.length > 1;
+  const first = views[0]!;
+  const fmts = (v: PluginView) => targetOf(v.plugin, s.settings, v.installed, true).formats.map((f) => f.toUpperCase()).join(", ");
+  const needsPrompt = views.some((v) => targetOf(v.plugin, s.settings, v.installed, true).location === "system");
+  const title = many ? t("update.titleMany", { n: views.length }) : t(mode === "reinstall" ? "update.titleReinstall" : "update.title", { name: first.plugin.name });
+  const rows = views.map((v) =>
+    h(
+      "div",
+      { class: "update-row" },
+      h(
+        "div",
+        { class: "row" },
+        h("b", { class: "update-name" }, v.plugin.name),
+        v.installed && mode === "update" ? display(v.installed.version, "dim") : null,
+        mode === "update" ? h("span", { class: "arrow" }, "→") : null,
+        display(v.plugin.latest.version),
+        v.installed && !v.installed.byCentral ? h("span", { class: "note" }, t("update.notByCentral")) : null,
+      ),
+      mode === "update" ? notes(v, many ? 4 : 12) : null,
+    ),
+  );
+  const will = many
+    ? t("update.willMany")
+    : mode === "reinstall"
+      ? t("update.willReinstall", { version: first.plugin.latest.version, formats: fmts(first) })
+      : t("update.will", { formats: fmts(first) });
+  return dialogFrame(
+    title,
+    a,
+    [
+      h("div", { class: "update-list" }, ...rows),
+      h("p", {}, will),
+      many && needsPrompt ? h("p", { class: "note" }, t(PLATFORM === "windows" ? "update.onePromptWin" : "update.onePrompt")) : null,
+      dawWarning(s),
+    ],
+    t(many ? "update.okMany" : mode === "reinstall" ? "update.okReinstall" : "update.ok"),
+  );
+}
+
+function whatsNewDialog(a: Actions, v: PluginView): HTMLElement {
+  const p = v.plugin;
+  const date = p.latest.releasedAt ? new Date(p.latest.releasedAt) : null;
+  return dialogFrame(
+    t("whatsNew.title", { name: p.name, version: p.latest.version }),
+    a,
+    [
+      date && !isNaN(date.getTime()) ? h("span", { class: "tiny-label" }, t("whatsNew.released", { date: date.toLocaleDateString("en-GB") })) : null,
+      notes(v, 40),
+    ],
+    v.status === "update" ? t("whatsNew.update") : null,
+    "primary",
+    t("whatsNew.close"),
+  );
+}
+
+function removeDialog(s: ViewState, a: Actions, views: PluginView[], all: boolean): HTMLElement {
+  const first = views[0]!;
+  const notByCentral = views.some((v) => v.installed && !v.installed.byCentral);
+  const body: Array<HTMLElement | null> = all
+    ? [h("p", {}, t("remove.plugins")), h("ul", { class: "notes" }, ...views.map((v) => h("li", {}, `${v.plugin.name} ${v.installed?.version ?? ""}`.trim())))]
+    : [h("p", {}, t("remove.files")), h("ul", { class: "paths" }, ...(first.installed?.paths ?? []).map((p) => h("li", {}, p)))];
+  body.push(
+    notByCentral ? h("p", { class: "note" }, t("remove.notByCentral")) : null,
+    h("p", { class: "note" }, t("remove.projects")),
+    views.length > 1 && views.some((v) => v.installed?.location === "system")
+      ? h("p", { class: "note" }, t(PLATFORM === "windows" ? "update.onePromptWin" : "update.onePrompt"))
+      : null,
+    dawWarning(s),
+  );
+  return dialogFrame(
+    all ? t("remove.titleAll", { n: views.length }) : t("remove.title", { name: first.plugin.name }),
+    a,
+    body,
+    t(all ? "remove.okAll" : "remove.ok"),
+    "danger",
+    t("remove.cancel"),
+  );
+}
+
+function dialog(s: ViewState, a: Actions): HTMLElement | null {
+  const d = s.dialog;
+  if (!d) return null;
+  switch (d.kind) {
+    case "replace":
+      return replaceDialog(s, a, d.view);
+    case "update":
+      return d.views.length ? updateDialog(s, a, d.views, d.mode) : null;
+    case "whatsNew":
+      return whatsNewDialog(a, d.view);
+    case "remove":
+      return d.views.length ? removeDialog(s, a, d.views, d.all) : null;
+  }
 }
 
 // ---- toast --------------------------------------------------------------------------------------------------------
@@ -415,11 +651,18 @@ export function render(root: HTMLElement, s: ViewState, a: Actions): void {
   const scroll = root.querySelector(".list")?.scrollTop ?? 0;
 
   root.replaceChildren(header(s, a), filterBar(s, a), banner(s, a) ?? "", list(s, a), footer(s));
-  const modal = settingsPanel(s, a) ?? replacePanel(s, a);
+  const modal = settingsPanel(s, a) ?? dialog(s, a);
   if (modal) root.append(modal);
 
   const listEl = root.querySelector(".list");
   if (listEl) listEl.scrollTop = scroll;
+  // a menu near the bottom of the list opens upwards, so it is not cut off
+  const menu = root.querySelector<HTMLElement>(".list .menu");
+  if (menu && listEl) {
+    const m = menu.getBoundingClientRect();
+    const l = listEl.getBoundingClientRect();
+    if (m.bottom > l.bottom - 4) menu.classList.add("menu-up");
+  }
   if (searchFocused) {
     const input = root.querySelector<HTMLInputElement>(".search");
     input?.focus();

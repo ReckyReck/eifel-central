@@ -156,8 +156,9 @@ input { font-family: inherit; user-select: text; -webkit-user-select: text; }
 
 .status { display: flex; align-items: center; gap: 9px; font-size: 10.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .badge-new { padding: 2px 6px; border-radius: 3px; font-size: 9px; color: #1d1608; background: var(--cream); letter-spacing: .12em; }
-.unit-action { display: flex; justify-content: flex-end; }
+.unit-action { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; }
 .unit-action .btn { width: 150px; }
+.unit-action .btn-small { height: 24px; font-size: 9.5px; }
 
 /* ---- footer ---------------------------------------------------------------------------------------------------- */
 .foot { display: flex; align-items: center; gap: 22px; height: 34px; padding: 0 6px; border-top: 1px solid #262627; font-size: 11.5px; color: var(--quiet); }
@@ -197,3 +198,34 @@ input { font-family: inherit; user-select: text; -webkit-user-select: text; }
 .confirm .warn { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 4px; background: #2a2114;
                  box-shadow: inset 0 0 0 1px #5a431d; }
 .confirm .warn .led { margin-top: 3px; }
+
+/* ---- step 7: drop-down menus (OPTIONS ▾, SEND FEEDBACK ▾) ------------------------------------------------------ */
+.menu-wrap { position: relative; display: inline-flex; }
+.menu { position: absolute; right: 0; top: calc(100% + 5px); z-index: 30; min-width: 210px; padding: 6px; display: flex; flex-direction: column;
+        border-radius: 4px; background: linear-gradient(180deg, #313132, #262627);
+        box-shadow: 0 0 0 1px rgba(0,0,0,.7), inset 0 1px 0 rgba(255,255,255,.08), 0 8px 22px rgba(0,0,0,.6); }
+.menu.menu-up { top: auto; bottom: calc(100% + 5px); }
+.menu-item { height: 30px; padding: 0 12px; border: 0; border-radius: 3px; text-align: left; white-space: nowrap; background: transparent;
+             color: var(--label); font-size: 12.5px; font-weight: 500; }
+.menu-item:hover:not(:disabled), .menu-item:focus-visible { color: #2a1803; outline: 0;
+             background: linear-gradient(180deg, var(--amber-hi), var(--amber) 45%, var(--amber-lo)); }
+.menu-item:disabled { opacity: .4; }
+.menu-sep { height: 1px; margin: 5px 4px; background: var(--line); }
+.menu-heading { padding: 4px 12px 6px; font-size: 9.5px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--quiet); }
+
+.btn-danger { color: #fff3ef; background: linear-gradient(180deg, #d4553f, var(--led-red) 50%, #9e2a20);
+              box-shadow: 0 0 10px rgba(200,56,43,.35), inset 0 1px 0 rgba(255,255,255,.3), 0 1px 2px rgba(0,0,0,.6); }
+.btn-danger:hover { filter: brightness(1.07); }
+
+/* ---- step 7: update / what's new / remove dialogs -------------------------------------------------------------- */
+.update-list { display: flex; flex-direction: column; gap: 10px; max-height: 46vh; overflow-y: auto; padding-right: 4px; }
+.update-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 4px; background: rgba(0,0,0,.18);
+              box-shadow: inset 0 0 0 1px rgba(255,255,255,.04); }
+.update-name { font-size: 14px; font-weight: 600; color: #f1ede4; margin-right: 4px; }
+.update-row .display { font-size: 12.5px; min-width: 56px; padding: 4px 7px; }
+.notes { margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.5; color: var(--label); }
+.notes li { margin: 1px 0; user-select: text; -webkit-user-select: text; }
+.paths { margin: 0; padding: 8px 12px; list-style: none; border-radius: 3px; background: #050505;
+         box-shadow: inset 0 1px 3px rgba(0,0,0,.9); font: 11.5px/1.6 var(--mono); color: var(--mint); overflow-x: auto; }
+.paths li { white-space: nowrap; user-select: text; -webkit-user-select: text; }
+.foot-daw { color: var(--amber-dim-text); }

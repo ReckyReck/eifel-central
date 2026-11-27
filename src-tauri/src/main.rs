@@ -4,17 +4,23 @@
 //   get_installed  - which catalog plug-ins are on disk, which version, installed by Central or not
 //   install        - download, SHA-256 check, unpack, copy (one password / UAC prompt for the system folder),
 //                    installed.json
+//   install_many   - "Update all": several plug-ins, ONE password / UAC prompt for all of them
 //   cancel_install - stops a running install before the copy step
+//   remove_plugins - OPTIONS > Remove and Settings > Uninstall all (one password / UAC prompt)
 // Progress goes to the window as "install-progress" events.
+// Small questions in system.rs: running_daws (footer + warnings), system_info and open_feedback ("Send feedback":
+// opens ONLY https://github.com/ReckyReck/eifel-feedback/issues/new... in the browser).
 
 // Release builds on Windows: no extra console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod installer;
+mod system;
 
-use installer::{Env, InstallError, InstallRequest, InstallResult, InstalledInfo, PluginQuery};
+use installer::{BatchResult, Env, InstallError, InstallRequest, InstallResult, InstalledInfo, PluginQuery, RemoveResult};
 use std::path::PathBuf;
 use tauri::{Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
 
 /// Mac: /Library/Audio/Plug-Ins and ~/Library/Audio/Plug-Ins.
 #[cfg(not(windows))]
@@ -71,8 +77,49 @@ async fn install(app: tauri::AppHandle, request: InstallRequest) -> Result<Insta
 }
 
 #[tauri::command]
+async fn install_many(app: tauri::AppHandle, requests: Vec<InstallRequest>) -> Result<BatchResult, InstallError> {
+    let env = env_for(&app).map_err(InstallError::Failed)?;
+    let emitter = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        installer::install_many(&env, &requests, &|p| {
+            let _ = emitter.emit("install-progress", p);
+        })
+    })
+    .await
+    .map_err(|e| InstallError::Failed(e.to_string()))?
+}
+
+#[tauri::command]
 fn cancel_install() {
     installer::cancel();
+}
+
+#[tauri::command]
+async fn remove_plugins(app: tauri::AppHandle, plugins: Vec<PluginQuery>) -> Result<RemoveResult, InstallError> {
+    let env = env_for(&app).map_err(InstallError::Failed)?;
+    tauri::async_runtime::spawn_blocking(move || installer::remove(&env, &plugins))
+        .await
+        .map_err(|e| InstallError::Failed(e.to_string()))?
+}
+
+#[tauri::command]
+async fn running_daws() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(system::running_daws).await.unwrap_or_default()
+}
+
+#[tauri::command]
+async fn system_info() -> String {
+    tauri::async_runtime::spawn_blocking(system::system_text).await.unwrap_or_default()
+}
+
+/// "Send feedback": opens the feedback form in the default browser. Only Recky's feedback address is accepted;
+/// the window itself has no permission to open anything.
+#[tauri::command]
+fn open_feedback(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !system::is_feedback_url(&url) {
+        return Err("Central opens only its own feedback page.".into());
+    }
+    app.opener().open_url(url, None::<&str>).map_err(|e| format!("The browser could not be opened ({e})."))
 }
 
 fn main() {
@@ -87,7 +134,18 @@ fn main() {
         std::process::exit(code);
     }
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_installed, install, cancel_install])
+        // no opener permission for the window (capabilities/default.json): only open_feedback above uses it
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            get_installed,
+            install,
+            install_many,
+            cancel_install,
+            remove_plugins,
+            running_daws,
+            system_info,
+            open_feedback
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Eifel Mastering Central");
 }

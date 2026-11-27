@@ -137,6 +137,9 @@ pub struct PluginQuery {
     pub bundle_names: BTreeMap<String, String>,
     #[serde(default)]
     pub bundle_id: Option<String>,
+    /// shared name, only for the password prompt when removing
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// What the window gets back for each plug-in found on disk.
@@ -703,8 +706,8 @@ pub fn copy_script(items: &[CopyItem], backup_dir: &Path, system: bool) -> Strin
     s
 }
 
-/// Runs the copy script - with one administrator prompt if `admin`.
-fn run_script(script_path: &Path, admin: bool, prompt: &str) -> Result<(), InstallError> {
+/// Runs a generated script (copy or remove) - with one administrator prompt if `admin`.
+fn run_script(script_path: &Path, admin: bool, prompt: &str, failed: &str, after: &str) -> Result<(), InstallError> {
     use std::process::Command;
     let output = if admin {
         let apple = format!(
@@ -716,7 +719,7 @@ fn run_script(script_path: &Path, admin: bool, prompt: &str) -> Result<(), Insta
     } else {
         Command::new("/bin/sh").arg(script_path).output()
     };
-    let output = output.map_err(|e| InstallError::Failed(format!("The copy step could not start ({e}). Nothing was installed.")))?;
+    let output = output.map_err(|e| InstallError::Failed(format!("{failed}: the step could not start ({e}). Nothing was changed.")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -725,10 +728,7 @@ fn run_script(script_path: &Path, admin: bool, prompt: &str) -> Result<(), Insta
         return Err(InstallError::Cancelled);
     }
     let detail = err.trim_start_matches("0:").trim();
-    fail(format!(
-        "Copying the plug-in failed ({}). Your previous version, if there was one, has been put back.",
-        if detail.is_empty() { "no details" } else { detail }
-    ))
+    fail(format!("{failed} ({}). {after}", if detail.is_empty() { "no details" } else { detail }))
 }
 
 // ---- copy without a shell (Windows) ---------------------------------------------------------------------------------
@@ -806,27 +806,76 @@ pub fn copy_into_place(items: &[CopyItem]) -> Result<(), String> {
     Ok(())
 }
 
-/// What the elevated helper gets: the copy steps. Written next to the downloaded files, read by
-/// `Eifel Mastering Central.exe --copy-plugins <plan.json>` running as administrator.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CopyPlan {
-    pub items: Vec<CopyItem>,
+/// All-or-nothing removal, done by Central itself (Windows way): every bundle is first renamed to
+/// "<name>.central-old" next to itself; if one cannot be renamed (a DAW has it open), the others are renamed back and
+/// nothing is removed. Then the renamed copies are deleted.
+pub fn remove_bundles(paths: &[PathBuf]) -> Result<(), String> {
+    let backup = |p: &Path| {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        p.with_file_name(format!("{name}{OLD_SUFFIX}"))
+    };
+    let mut moved: Vec<&PathBuf> = Vec::new();
+    for p in paths {
+        if !exists(p) {
+            continue;
+        }
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let b = backup(p);
+        let step = remove_any(&b)
+            .map_err(|e| format!("cannot remove an old backup of \"{name}\" ({e})"))
+            .and_then(|_| {
+                fs::rename(p, &b)
+                    .map_err(|e| format!("cannot remove \"{name}\" - is your DAW open? Close it and try again ({e})"))
+            });
+        if let Err(msg) = step {
+            for m in moved.iter().rev() {
+                let _ = fs::rename(backup(m), m);
+            }
+            return Err(msg);
+        }
+        moved.push(p);
+    }
+    for m in moved {
+        let _ = remove_any(&backup(m));
+    }
+    Ok(())
 }
 
-/// The helper only copies Recky's plug-in bundles into the given plug-in folders, nothing else: every destination
-/// must be a plain bundle name directly inside one of `allowed_dirs`, its backup "<dest>.central-old" next to it,
-/// and the source a folder.
+/// What the elevated helper gets: the copy steps and/or bundles to remove. Written into Central's private temporary
+/// folder, read by `Eifel Mastering Central.exe --copy-plugins <plan.json>` running as administrator.
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct CopyPlan {
+    #[serde(default)]
+    pub items: Vec<CopyItem>,
+    /// bundles to remove (step 7)
+    #[serde(default)]
+    pub remove: Vec<PathBuf>,
+}
+
+/// The helper only copies or removes Recky's plug-in bundles in the given plug-in folders, nothing else: every
+/// destination (and every bundle to remove) must be a plain bundle name directly inside one of `allowed_dirs`, a
+/// copy's backup "<dest>.central-old" next to it, and its source a folder.
 pub fn check_plan(plan: &CopyPlan, allowed_dirs: &[PathBuf]) -> Result<(), String> {
-    if plan.items.is_empty() {
+    if plan.items.is_empty() && plan.remove.is_empty() {
         return Err("nothing to copy".into());
     }
-    for it in &plan.items {
-        let name = it.dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let parent_ok = it.dest.parent().is_some_and(|p| allowed_dirs.iter().any(|a| a == p));
+    let place_ok = |p: &Path| {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let parent_ok = p.parent().is_some_and(|d| allowed_dirs.iter().any(|a| a == d));
         let name_ok = [Format::Vst3, Format::Clap, Format::Au].iter().any(|f| is_bundle_name(&name, *f));
+        (name, parent_ok && name_ok)
+    };
+    for it in &plan.items {
+        let (name, ok) = place_ok(&it.dest);
         let backup_ok = it.backup == it.dest.with_file_name(format!("{name}{OLD_SUFFIX}"));
-        if !parent_ok || !name_ok || !backup_ok || !it.src.is_dir() {
+        if !ok || !backup_ok || !it.src.is_dir() {
             return Err(format!("refused copy step for \"{name}\""));
+        }
+    }
+    for p in &plan.remove {
+        let (name, ok) = place_ok(p);
+        if !ok {
+            return Err(format!("refused remove step for \"{name}\""));
         }
     }
     Ok(())
@@ -839,7 +888,12 @@ pub fn run_copy_helper(plan_path: &Path, allowed_dirs: &[PathBuf]) -> i32 {
         .map_err(|e| format!("cannot read the copy plan ({e})"))
         .and_then(|b| serde_json::from_slice::<CopyPlan>(&b).map_err(|e| format!("damaged copy plan ({e})")))
         .and_then(|plan| check_plan(&plan, allowed_dirs).map(|_| plan))
-        .and_then(|plan| copy_into_place(&plan.items));
+        .and_then(|plan| {
+            if !plan.items.is_empty() {
+                copy_into_place(&plan.items)?;
+            }
+            remove_bundles(&plan.remove)
+        });
     match result {
         Ok(()) => 0,
         Err(msg) => {
@@ -919,6 +973,40 @@ pub fn run_elevated(_exe: &Path, _args: &[String]) -> Result<Elevated, String> {
     Err("Run as administrator exists only on Windows".into())
 }
 
+/// Result of starting the Windows administrator helper.
+enum HelperOutcome {
+    Done,
+    Declined,
+    /// the helper ran but refused or failed; the reason from its log
+    Failed(String),
+    /// the helper could not be started
+    NotStarted(String),
+}
+
+/// Writes `plan` into the private work folder and runs `Central.exe --copy-plugins <plan.json>` as administrator
+/// (one Windows UAC prompt).
+fn run_helper(plan: &CopyPlan, work: &Path) -> HelperOutcome {
+    let plan_path = work.join("plan.json");
+    let written = serde_json::to_vec_pretty(plan).map_err(|e| e.to_string()).and_then(|b| fs::write(&plan_path, b).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        return HelperOutcome::NotStarted(format!("cannot write the plan: {e}"));
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return HelperOutcome::NotStarted(format!("Central cannot find itself: {e}")),
+    };
+    let args = vec!["--copy-plugins".to_string(), plan_path.to_string_lossy().into_owned()];
+    match run_elevated(&exe, &args) {
+        Ok(Elevated::Declined) => HelperOutcome::Declined,
+        Ok(Elevated::Exit(0)) => HelperOutcome::Done,
+        Ok(Elevated::Exit(code)) => {
+            let log = fs::read_to_string(plan_path.with_extension("log")).unwrap_or_default();
+            HelperOutcome::Failed(if log.trim().is_empty() { format!("code {code}") } else { log.trim().to_string() })
+        }
+        Err(e) => HelperOutcome::NotStarted(if e.is_empty() { "no details".into() } else { e }),
+    }
+}
+
 /// Windows copy: in-process for the user's own folder, through the elevated helper (one UAC prompt) for the system
 /// folder.
 fn copy_native(items: &[CopyItem], work: &Path, admin: bool) -> Result<(), InstallError> {
@@ -930,23 +1018,11 @@ fn copy_native(items: &[CopyItem], work: &Path, admin: bool) -> Result<(), Insta
     if !admin {
         return copy_into_place(items).map_err(|m| put_back(&m));
     }
-    let plan_path = work.join("plan.json");
-    let plan = CopyPlan { items: items.to_vec() };
-    fs::write(&plan_path, serde_json::to_vec_pretty(&plan).map_err(std::io::Error::other)?)?;
-    let exe = std::env::current_exe().map_err(|e| InstallError::Failed(format!("Central cannot find itself ({e}).")))?;
-    let args = vec!["--copy-plugins".to_string(), plan_path.to_string_lossy().into_owned()];
-    match run_elevated(&exe, &args) {
-        Ok(Elevated::Declined) => Err(InstallError::Cancelled),
-        Ok(Elevated::Exit(0)) => Ok(()),
-        Ok(Elevated::Exit(code)) => {
-            let log = fs::read_to_string(plan_path.with_extension("log")).unwrap_or_default();
-            let detail = if log.trim().is_empty() { format!("code {code}") } else { log.trim().to_string() };
-            Err(put_back(&detail))
-        }
-        Err(e) => fail(format!(
-            "Windows could not start the administrator step ({}). Nothing was installed.",
-            if e.is_empty() { "no details" } else { &e }
-        )),
+    match run_helper(&CopyPlan { items: items.to_vec(), remove: vec![] }, work) {
+        HelperOutcome::Done => Ok(()),
+        HelperOutcome::Declined => Err(InstallError::Cancelled),
+        HelperOutcome::Failed(detail) => Err(put_back(&detail)),
+        HelperOutcome::NotStarted(e) => fail(format!("Windows could not start the administrator step ({e}). Nothing was installed.")),
     }
 }
 
@@ -959,48 +1035,73 @@ fn refresh_audio_units() {
     }
 }
 
-/// The whole install. `progress` is called often during the download, once per later phase.
-pub fn install(env: &Env, req: &InstallRequest, progress: &dyn Fn(Progress)) -> Result<InstallResult, InstallError> {
-    if BUSY.swap(true, Ordering::SeqCst) {
-        return Err(InstallError::Busy);
-    }
-    let _busy = BusyGuard;
-    CANCEL.store(false, Ordering::SeqCst);
-
-    let checked = check_request(req)?;
-    let report = |phase: &'static str, done: u64, total: u64| progress(Progress { id: req.plugin_id.clone(), phase, done, total });
-
-    // private temporary folder
+/// A private temporary folder for one job (install, update all, remove); removed again when the job ends.
+fn work_dir(env: &Env) -> Result<WorkDir, InstallError> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let work = env.temp_dir.join(format!("eifel-central-{}-{}-{stamp}", req.plugin_id, std::process::id()));
+    let work = env.temp_dir.join(format!("eifel-central-{}-{stamp}", std::process::id()));
     fs::create_dir_all(&work)?;
     set_mode(&work, 0o700)?;
-    let work = WorkDir(work);
-
-    // 1. download
-    let zip_path = work.0.join("download.zip");
-    let sha = download(&req.url, req.size, &zip_path, &|d, t| report("download", d, t))?;
-    install_downloaded(env, req, &checked, &work.0, &zip_path, &sha, &report)
+    Ok(WorkDir(work))
 }
 
-/// Everything after the download: checksum, unpack, copy, installed.json. Separate so the tests can run it offline.
-fn install_downloaded(
+/// "A, B and C" - at most four names, then "and 3 more".
+fn name_list(names: &[String]) -> String {
+    let shown: Vec<&str> = names.iter().take(if names.len() > 4 { 3 } else { 4 }).map(|s| s.as_str()).collect();
+    let rest = names.len() - shown.len();
+    match (shown.len(), rest) {
+        (0, _) => String::new(),
+        (1, 0) => shown[0].to_string(),
+        (_, 0) => format!("{} and {}", shown[..shown.len() - 1].join(", "), shown[shown.len() - 1]),
+        _ => format!("{} and {rest} more", shown.join(", ")),
+    }
+}
+
+/// One plug-in of a job, downloaded, checked and unpacked: what goes where.
+struct Prepared<'a> {
+    req: &'a InstallRequest,
+    /// format, unpacked bundle, destination
+    targets: Vec<(Format, PathBuf, PathBuf)>,
+}
+
+/// A plug-in of an "update all" (or single install) that did not work, with a sentence for the user.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchFailure {
+    pub id: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResult {
+    pub installed: Vec<InstallResult>,
+    pub failed: Vec<BatchFailure>,
+}
+
+fn message_of(e: InstallError) -> String {
+    match e {
+        InstallError::Failed(m) => m,
+        InstallError::Cancelled => "Cancelled. Nothing was changed.".into(),
+        InstallError::Busy => "Another plug-in is being installed.".into(),
+    }
+}
+
+/// Checksum, unpack, check the bundles (into `dir`). Changes nothing on the computer.
+fn prepare<'a>(
     env: &Env,
-    req: &InstallRequest,
+    req: &'a InstallRequest,
     checked: &Checked,
-    work: &Path,
+    dir: &Path,
     zip_path: &Path,
     sha: &str,
     report: &dyn Fn(&'static str, u64, u64),
-) -> Result<InstallResult, InstallError> {
+) -> Result<Prepared<'a>, InstallError> {
     report("verify", 0, 1);
     if !sha.eq_ignore_ascii_case(&req.sha256) {
         return fail("The download does not match the catalog's checksum (SHA-256), so it may be damaged or not Recky's file. Nothing was installed.");
     }
-
-    // 2. unpack + check contents
     report("unpack", 0, 1);
-    let unpacked = work.join("unpacked");
+    let unpacked = dir.join("unpacked");
     unpack(zip_path, &unpacked)?;
     for (_, name) in &checked.targets {
         let b = unpacked.join(name);
@@ -1014,67 +1115,311 @@ fn install_downloaded(
     if cancelled() {
         return Err(InstallError::Cancelled);
     }
-
-    // 3. copy (one password / UAC prompt for the system folder)
-    let root = env.root(req.location).to_path_buf();
-    let backup_dir = work.join("previous");
-    let items: Vec<CopyItem> = checked
+    let root = env.root(req.location);
+    let targets = checked
         .targets
         .iter()
-        .enumerate()
-        .map(|(i, (format, name))| {
-            let dest = root.join(format.folder()).join(name);
-            let backup = if env.native_copy {
-                dest.with_file_name(format!("{name}{OLD_SUFFIX}"))
-            } else {
-                backup_dir.join(format!("{i}-{name}"))
-            };
-            CopyItem { src: unpacked.join(name), dest, backup }
-        })
+        .map(|(format, name)| (*format, unpacked.join(name), root.join(format.folder()).join(name)))
         .collect();
-    let system = req.location == Location::System;
-    let admin = system && env.use_admin_prompt;
-    report(if admin { "password" } else { "copy" }, 0, 1);
-    if env.native_copy {
-        copy_native(&items, work, admin)?;
-    } else {
-        let script_path = work.join("copy.sh");
-        fs::write(&script_path, copy_script(&items, &backup_dir, admin))?;
-        set_mode(&script_path, 0o700)?;
-        let prompt = format!(
-            "Eifel Mastering Central wants to install {} {} into the plug-in folder for all users (/Library/Audio/Plug-Ins).",
-            req.plugin_name, req.version
-        );
-        run_script(&script_path, admin, &prompt)?;
+    Ok(Prepared { req, targets })
+}
+
+/// The copy for all prepared plug-ins: first everything for the system folder (ONE password / UAC prompt), then
+/// everything for the user's own folder. Each of the two is all-or-nothing. Then installed.json.
+fn place(env: &Env, prepared: &[Prepared], work: &Path, report: &dyn Fn(&str, &'static str, u64, u64)) -> Result<BatchResult, InstallError> {
+    let mut result = BatchResult { installed: Vec::new(), failed: Vec::new() };
+    let mut placed: Vec<&Prepared> = Vec::new();
+    for system in [true, false] {
+        let group: Vec<&Prepared> = prepared.iter().filter(|p| (p.req.location == Location::System) == system).collect();
+        if group.is_empty() {
+            continue;
+        }
+        let admin = system && env.use_admin_prompt;
+        let backup_dir = work.join(if system { "previous-system" } else { "previous-user" });
+        let mut items = Vec::new();
+        for (i, p) in group.iter().enumerate() {
+            for (j, (_, src, dest)) in p.targets.iter().enumerate() {
+                let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let backup = if env.native_copy {
+                    dest.with_file_name(format!("{name}{OLD_SUFFIX}"))
+                } else {
+                    backup_dir.join(format!("{i}-{j}-{name}"))
+                };
+                items.push(CopyItem { src: src.clone(), dest: dest.clone(), backup });
+            }
+        }
+        for p in &group {
+            report(&p.req.plugin_id, if admin { "password" } else { "copy" }, 0, 1);
+        }
+        let outcome = if env.native_copy {
+            copy_native(&items, work, admin)
+        } else {
+            let script_path = work.join(if system { "copy-system.sh" } else { "copy-user.sh" });
+            fs::write(&script_path, copy_script(&items, &backup_dir, admin))?;
+            set_mode(&script_path, 0o700)?;
+            let names: Vec<String> = group.iter().map(|p| format!("{} {}", p.req.plugin_name, p.req.version)).collect();
+            let prompt = format!(
+                "Eifel Mastering Central wants to install {} into the plug-in folder for all users (/Library/Audio/Plug-Ins).",
+                name_list(&names)
+            );
+            run_script(&script_path, admin, &prompt, "Copying the plug-in failed", "Your previous version, if there was one, has been put back.")
+        };
+        match outcome {
+            Ok(()) => {
+                for p in &group {
+                    report(&p.req.plugin_id, "copy", 1, 1);
+                }
+                placed.extend(group);
+            }
+            // the system folder comes first: a cancelled password prompt means nothing was changed at all
+            Err(InstallError::Cancelled) if placed.is_empty() => return Err(InstallError::Cancelled),
+            Err(e) => {
+                let msg = message_of(e);
+                result.failed.extend(group.iter().map(|p| BatchFailure { id: p.req.plugin_id.clone(), message: msg.clone() }));
+            }
+        }
     }
-    report("copy", 1, 1);
-    if checked.targets.iter().any(|(f, _)| *f == Format::Au) {
+    if placed.iter().any(|p| p.targets.iter().any(|(f, _, _)| *f == Format::Au)) {
         refresh_audio_units();
     }
 
-    // 4. remember it
-    let formats: Vec<Format> = checked.targets.iter().map(|(f, _)| *f).collect();
-    let paths: Vec<String> = items.iter().map(|it| it.dest.to_string_lossy().into_owned()).collect();
-    let mut file = read_installed(env);
-    file.schema_version = 1;
-    file.plugins.insert(
-        req.plugin_id.clone(),
-        InstalledRecord {
-            id: req.plugin_id.clone(),
-            version: req.version.clone(),
-            formats: formats.clone(),
-            location: req.location,
-            paths: paths.clone(),
-            installed_at: now_utc(),
-        },
-    );
-    write_installed(env, &file).map_err(|e| {
-        InstallError::Failed(format!(
-            "The plug-in was installed, but Central could not note it in installed.json ({e}). It will show as \"not by Central\"."
-        ))
-    })?;
-    report("done", 1, 1);
-    Ok(InstallResult { id: req.plugin_id.clone(), version: req.version.clone(), formats, location: req.location, paths })
+    // remember them
+    if !placed.is_empty() {
+        let mut file = read_installed(env);
+        file.schema_version = 1;
+        for p in &placed {
+            let formats: Vec<Format> = p.targets.iter().map(|(f, _, _)| *f).collect();
+            let paths: Vec<String> = p.targets.iter().map(|(_, _, d)| d.to_string_lossy().into_owned()).collect();
+            file.plugins.insert(
+                p.req.plugin_id.clone(),
+                InstalledRecord {
+                    id: p.req.plugin_id.clone(),
+                    version: p.req.version.clone(),
+                    formats: formats.clone(),
+                    location: p.req.location,
+                    paths: paths.clone(),
+                    installed_at: now_utc(),
+                },
+            );
+            result.installed.push(InstallResult { id: p.req.plugin_id.clone(), version: p.req.version.clone(), formats, location: p.req.location, paths });
+        }
+        write_installed(env, &file).map_err(|e| {
+            InstallError::Failed(format!(
+                "The plug-in was installed, but Central could not note it in installed.json ({e}). It will show as \"not by Central\"."
+            ))
+        })?;
+        for p in &placed {
+            report(&p.req.plugin_id, "done", 1, 1);
+        }
+    }
+    Ok(result)
+}
+
+/// One install (INSTALL, REPLACE, UPDATE, REINSTALL).
+pub fn install(env: &Env, req: &InstallRequest, progress: &dyn Fn(Progress)) -> Result<InstallResult, InstallError> {
+    let mut r = install_many(env, std::slice::from_ref(req), progress)?;
+    if let Some(f) = r.failed.pop() {
+        return Err(InstallError::Failed(f.message));
+    }
+    r.installed.pop().ok_or_else(|| InstallError::Failed("Nothing was installed.".into()))
+}
+
+/// Several plug-ins in one go ("Update all"): downloads and checks them one after the other, then copies all of
+/// them with ONE password / UAC prompt. A plug-in whose download or check fails is left out (and reported); the
+/// others still go ahead. Cancel (button or password prompt) stops everything and changes nothing.
+pub fn install_many(env: &Env, reqs: &[InstallRequest], progress: &dyn Fn(Progress)) -> Result<BatchResult, InstallError> {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return Err(InstallError::Busy);
+    }
+    let _busy = BusyGuard;
+    CANCEL.store(false, Ordering::SeqCst);
+    let report = |id: &str, phase: &'static str, done: u64, total: u64| progress(Progress { id: id.to_string(), phase, done, total });
+
+    let work = work_dir(env)?;
+    let mut prepared: Vec<Prepared> = Vec::new();
+    let mut failed: Vec<BatchFailure> = Vec::new();
+    for (i, req) in reqs.iter().enumerate() {
+        if cancelled() {
+            return Err(InstallError::Cancelled);
+        }
+        if prepared.iter().any(|p| p.req.plugin_id == req.plugin_id) || failed.iter().any(|f| f.id == req.plugin_id) {
+            continue; // the same plug-in twice
+        }
+        let checked = match check_request(req) {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(BatchFailure { id: req.plugin_id.clone(), message: message_of(e) });
+                continue;
+            }
+        };
+        let dir = work.0.join(i.to_string());
+        fs::create_dir_all(&dir)?;
+        let zip_path = dir.join("download.zip");
+        let id = req.plugin_id.as_str();
+        let r = download(&req.url, req.size, &zip_path, &|d, t| report(id, "download", d, t))
+            .and_then(|sha| prepare(env, req, &checked, &dir, &zip_path, &sha, &|ph, d, t| report(id, ph, d, t)));
+        match r {
+            Ok(p) => prepared.push(p),
+            Err(InstallError::Cancelled) => return Err(InstallError::Cancelled),
+            Err(e) => failed.push(BatchFailure { id: req.plugin_id.clone(), message: message_of(e) }),
+        }
+    }
+    let mut result = place(env, &prepared, &work.0, &report)?;
+    failed.append(&mut result.failed);
+    result.failed = failed;
+    Ok(result)
+}
+
+/// Everything after the download for one plug-in (the tests run it offline).
+#[cfg(test)]
+fn install_downloaded(
+    env: &Env,
+    req: &InstallRequest,
+    checked: &Checked,
+    work: &Path,
+    zip_path: &Path,
+    sha: &str,
+    report: &dyn Fn(&'static str, u64, u64),
+) -> Result<InstallResult, InstallError> {
+    let p = prepare(env, req, checked, work, zip_path, sha, report)?;
+    let mut r = place(env, std::slice::from_ref(&p), work, &|_, ph, d, t| report(ph, d, t))?;
+    if let Some(f) = r.failed.pop() {
+        return Err(InstallError::Failed(f.message));
+    }
+    r.installed.pop().ok_or_else(|| InstallError::Failed("Nothing was installed.".into()))
+}
+
+// ---- remove (step 7) ------------------------------------------------------------------------------------------------
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveResult {
+    /// plug-ins that are completely gone now
+    pub removed: Vec<String>,
+    /// the bundles that were deleted
+    pub paths: Vec<String>,
+}
+
+/// The shell script that removes bundles (Mac). All-or-nothing: every bundle is first moved into `backup_dir`; if one
+/// cannot be moved, the others are moved back. Then `backup_dir` is deleted.
+pub fn remove_script(paths: &[PathBuf], backup_dir: &Path) -> String {
+    let mut s = String::new();
+    s.push_str("#!/bin/sh\n# Eifel Mastering Central - removes plug-ins (generated, deleted afterwards)\nset -u\n");
+    for i in 0..paths.len() {
+        s.push_str(&format!("M{i}=0\n"));
+    }
+    s.push_str("rollback() {\n");
+    for (i, p) in paths.iter().enumerate().rev() {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let b = sh_quote(&backup_dir.join(format!("{i}-{name}")).to_string_lossy());
+        s.push_str(&format!("  if [ $M{i} = 1 ]; then mv {b} {}; fi\n", sh_quote(&p.to_string_lossy())));
+    }
+    s.push_str("  :\n}\n");
+    s.push_str("fail() { echo \"$1\" >&2; rollback; exit 1; }\n");
+    s.push_str(&format!("mkdir -p {} || fail 'cannot create the backup folder'\n", sh_quote(&backup_dir.to_string_lossy())));
+    for (i, p) in paths.iter().enumerate() {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let d = sh_quote(&p.to_string_lossy());
+        let b = sh_quote(&backup_dir.join(format!("{i}-{name}")).to_string_lossy());
+        s.push_str(&format!("if [ -e {d} ] || [ -L {d} ]; then mv {d} {b} || fail \"cannot remove \"{}; M{i}=1; fi\n", sh_quote(&name)));
+    }
+    s.push_str(&format!("rm -rf {}\nexit 0\n", sh_quote(&backup_dir.to_string_lossy())));
+    s
+}
+
+/// Removes plug-ins (OPTIONS > Remove, Settings > Uninstall all): every copy found in both plug-in folders (the
+/// same scan as get_installed, so only bundles that are really these plug-ins). The system folder first with ONE
+/// password / UAC prompt for everything, then the user's own folder. installed.json forgets the removed ones.
+pub fn remove(env: &Env, plugins: &[PluginQuery]) -> Result<RemoveResult, InstallError> {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return Err(InstallError::Busy);
+    }
+    let _busy = BusyGuard;
+    let found = get_installed(env, plugins);
+    let in_folder = |p: &Path, root: &Path| {
+        [Format::Au, Format::Vst3, Format::Clap].iter().any(|f| {
+            p.parent() == Some(root.join(f.folder()).as_path())
+                && p.file_name().is_some_and(|n| is_bundle_name(&n.to_string_lossy(), *f))
+        })
+    };
+    let (mut system, mut user) = (Vec::new(), Vec::new());
+    for info in &found {
+        for p in &info.paths {
+            let p = PathBuf::from(p);
+            if in_folder(&p, &env.system_root) {
+                system.push(p);
+            } else if in_folder(&p, &env.user_root) {
+                user.push(p);
+            }
+        }
+    }
+    let all: Vec<PathBuf> = system.iter().chain(user.iter()).cloned().collect();
+    if all.is_empty() {
+        return Ok(RemoveResult { removed: Vec::new(), paths: Vec::new() });
+    }
+    let work = work_dir(env)?;
+    let names: Vec<String> = found
+        .iter()
+        .map(|i| plugins.iter().find(|q| q.id == i.id).and_then(|q| q.name.clone()).unwrap_or_else(|| i.id.clone()))
+        .collect();
+    let removing = |detail: &str| {
+        InstallError::Failed(format!("Removing failed ({detail}). Nothing was removed from that folder."))
+    };
+
+    let mut error: Option<InstallError> = None;
+    for (is_system, paths) in [(true, &system), (false, &user)] {
+        if paths.is_empty() || error.is_some() {
+            continue;
+        }
+        let admin = is_system && env.use_admin_prompt;
+        let outcome = if env.native_copy {
+            if admin {
+                match run_helper(&CopyPlan { items: vec![], remove: paths.clone() }, &work.0) {
+                    HelperOutcome::Done => Ok(()),
+                    HelperOutcome::Declined => Err(InstallError::Cancelled),
+                    HelperOutcome::Failed(d) => Err(removing(&d)),
+                    HelperOutcome::NotStarted(e) => fail(format!("Windows could not start the administrator step ({e}). Nothing was removed.")),
+                }
+            } else {
+                remove_bundles(paths).map_err(|m| removing(&m))
+            }
+        } else {
+            let tag = if is_system { "system" } else { "user" };
+            let script_path = work.0.join(format!("remove-{tag}.sh"));
+            fs::write(&script_path, remove_script(paths, &work.0.join(format!("removed-{tag}"))))?;
+            set_mode(&script_path, 0o700)?;
+            let prompt = format!(
+                "Eifel Mastering Central wants to remove {} from the plug-in folder for all users (/Library/Audio/Plug-Ins).",
+                name_list(&names)
+            );
+            run_script(&script_path, admin, &prompt, "Removing failed", "Nothing was removed from that folder.")
+        };
+        match outcome {
+            Ok(()) => {}
+            // system folder first: a cancelled prompt means nothing was changed at all
+            Err(InstallError::Cancelled) if is_system => return Err(InstallError::Cancelled),
+            Err(e) => error = Some(e),
+        }
+    }
+
+    // what is gone now
+    let gone: Vec<String> = all.iter().filter(|p| !exists(p)).map(|p| p.to_string_lossy().into_owned()).collect();
+    let removed: Vec<String> = found.iter().filter(|i| i.paths.iter().all(|p| !exists(Path::new(p)))).map(|i| i.id.clone()).collect();
+    if gone.iter().any(|p| p.ends_with(Format::Au.suffix())) {
+        refresh_audio_units();
+    }
+    if !removed.is_empty() {
+        let mut file = read_installed(env);
+        let before = file.plugins.len();
+        file.plugins.retain(|id, _| !removed.contains(id));
+        if file.plugins.len() != before {
+            write_installed(env, &file)?;
+        }
+    }
+    match error {
+        Some(e) => Err(e),
+        None => Ok(RemoveResult { removed, paths: gone }),
+    }
 }
 
 // ---- tests ----------------------------------------------------------------------------------------------------------
@@ -1248,7 +1593,7 @@ mod tests {
         let items = items_for(&env, &work, &names, Location::User);
         let script = work.join("copy.sh");
         fs::write(&script, copy_script(&items, &work.join("previous"), false)).unwrap();
-        run_script(&script, false, "").unwrap();
+        run_script(&script, false, "", "Copying the plug-in failed", "Your previous version, if there was one, has been put back.").unwrap();
         assert_eq!(bundle_info(&old_au).version.as_deref(), Some("0.2.0"));
         assert_eq!(bundle_info(&env.user_root.join("VST3/V.vst3")).version.as_deref(), Some("0.2.0"));
         assert!(!work.join("previous").exists(), "backup is removed after success");
@@ -1258,7 +1603,7 @@ mod tests {
         fs::write(work.join("unpacked/V.component/Contents/Info.plist"), info_plist("com.mystudio.comp165", "0.3.0")).unwrap();
         fs::remove_dir_all(work.join("unpacked/V.vst3")).unwrap();
         fs::write(&script, copy_script(&items, &work.join("previous"), false)).unwrap();
-        let r = run_script(&script, false, "");
+        let r = run_script(&script, false, "", "Copying the plug-in failed", "Your previous version, if there was one, has been put back.");
         assert!(matches!(r, Err(InstallError::Failed(ref m)) if m.contains("put back")), "{r:?}");
         assert_eq!(bundle_info(&old_au).version.as_deref(), Some("0.2.0"), "AU rolled back");
         assert_eq!(bundle_info(&env.user_root.join("VST3/V.vst3")).version.as_deref(), Some("0.2.0"), "VST3 rolled back");
@@ -1276,7 +1621,7 @@ mod tests {
         let mut names = BTreeMap::new();
         names.insert("au".to_string(), "V.component".to_string());
         names.insert("vst3".to_string(), "V.vst3".to_string());
-        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()) }];
+        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()), name: None }];
 
         assert!(get_installed(&env, &q).is_empty());
 
@@ -1363,7 +1708,7 @@ mod tests {
         let r = install_downloaded(&env, &req, &checked, &work, &zip_path, &sha, &report).unwrap();
         assert_eq!(r.formats, vec![Format::Au, Format::Vst3]);
         assert_eq!(*phases.borrow().last().unwrap(), "done");
-        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()) }];
+        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()), name: None }];
         let found = get_installed(&env, &q);
         assert_eq!(found.len(), 1);
         assert!(found[0].by_central);
@@ -1571,7 +1916,7 @@ mod tests {
         make_win_bundle(&src, "0.1.0", "4D737464");
         let ok = CopyItem { src: src.clone(), dest: vst3.join("A.vst3"), backup: vst3.join("A.vst3.central-old") };
         let allowed = vec![vst3.clone()];
-        assert!(check_plan(&CopyPlan { items: vec![ok.clone()] }, &allowed).is_ok());
+        assert!(check_plan(&CopyPlan { items: vec![ok.clone()], remove: vec![] }, &allowed).is_ok());
         let bad = [
             CopyItem { dest: base.join("Windows/System32/A.vst3"), backup: base.join("Windows/System32/A.vst3.central-old"), ..ok.clone() },
             CopyItem { dest: vst3.join("evil.dll"), backup: vst3.join("evil.dll.central-old"), ..ok.clone() },
@@ -1580,17 +1925,31 @@ mod tests {
             CopyItem { src: base.join("missing.vst3"), ..ok.clone() },
         ];
         for b in bad {
-            assert!(check_plan(&CopyPlan { items: vec![ok.clone(), b.clone()] }, &allowed).is_err(), "{b:?}");
+            assert!(check_plan(&CopyPlan { items: vec![ok.clone(), b.clone()], remove: vec![] }, &allowed).is_err(), "{b:?}");
         }
-        assert!(check_plan(&CopyPlan { items: vec![] }, &allowed).is_err());
+        assert!(check_plan(&CopyPlan { items: vec![], remove: vec![] }, &allowed).is_err());
 
         // the helper itself: plan file in, copy done, exit code 0; a refused plan writes the reason into plan.log
         let plan_path = base.join("work/plan.json");
-        fs::write(&plan_path, serde_json::to_vec(&CopyPlan { items: vec![ok.clone()] }).unwrap()).unwrap();
+        fs::write(&plan_path, serde_json::to_vec(&CopyPlan { items: vec![ok.clone()], remove: vec![] }).unwrap()).unwrap();
         assert_eq!(run_copy_helper(&plan_path, &allowed), 0);
         assert_eq!(win_version(&vst3.join("A.vst3")).as_deref(), Some("0.1.0"));
         assert_eq!(run_copy_helper(&plan_path, &[base.join("other")]), 1);
         assert!(fs::read_to_string(base.join("work/plan.log")).unwrap().contains("refused"));
+
+        // step 7: a plan that only removes - only bundles directly in the allowed folder
+        let rm_ok = CopyPlan { items: vec![], remove: vec![vst3.join("A.vst3")] };
+        assert!(check_plan(&rm_ok, &allowed).is_ok());
+        for bad in [base.join("Windows/System32/A.vst3"), vst3.join("evil.dll"), vst3.join("sub/A.vst3"), vst3.clone()] {
+            let plan = CopyPlan { items: vec![], remove: vec![vst3.join("A.vst3"), bad.clone()] };
+            assert!(check_plan(&plan, &allowed).is_err(), "{bad:?}");
+        }
+        fs::write(&plan_path, serde_json::to_vec(&rm_ok).unwrap()).unwrap();
+        assert_eq!(run_copy_helper(&plan_path, &allowed), 0);
+        assert!(!vst3.join("A.vst3").exists() && !vst3.join("A.vst3.central-old").exists());
+        // an old helper plan without "remove" still reads
+        let old: CopyPlan = serde_json::from_str(r#"{"items":[]}"#).unwrap();
+        assert!(old.remove.is_empty());
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -1630,7 +1989,7 @@ mod tests {
         // an old copy from another installer is replaced
         let dest = env.system_root.join("VST3/Reckys Velvet.vst3");
         make_win_bundle(&dest, "0.0.9", "4D737464");
-        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()) }];
+        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()), name: None }];
         let before = get_installed(&env, &q);
         assert_eq!((before[0].version.as_str(), before[0].by_central), ("0.0.9", false));
 
@@ -1696,5 +2055,183 @@ mod tests {
         assert!(is_bundle_name("Reckys Velvet.vst3", Format::Vst3));
         assert!(!is_bundle_name(".vst3", Format::Vst3));
         assert!(!is_bundle_name("a/b.vst3", Format::Vst3));
+        let names = |n: &[&str]| name_list(&n.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(names(&["A"]), "A");
+        assert_eq!(names(&["A", "B"]), "A and B");
+        assert_eq!(names(&["A", "B", "C", "D"]), "A, B, C and D");
+        assert_eq!(names(&["A", "B", "C", "D", "E", "F"]), "A, B, C and 3 more");
+    }
+
+    /// remove() and install_many() refuse to run twice at once ("busy"): tests that call them take turns.
+    static JOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn velvet_query(au: &str, vst3: &str) -> Vec<PluginQuery> {
+        let mut names = BTreeMap::new();
+        names.insert("au".to_string(), au.to_string());
+        names.insert("vst3".to_string(), vst3.to_string());
+        vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: Some("com.mystudio.comp165".into()), name: Some("Recky's Velvet".into()) }]
+    }
+
+    fn record(env: &Env, id: &str, version: &str, loc: Location, paths: &[&Path]) {
+        let mut file = read_installed(env);
+        file.plugins.insert(
+            id.into(),
+            InstalledRecord {
+                id: id.into(),
+                version: version.into(),
+                formats: vec![Format::Au],
+                location: loc,
+                paths: paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+                installed_at: now_utc(),
+            },
+        );
+        write_installed(env, &file).unwrap();
+    }
+
+    /// Step 7, Mac way: REMOVE takes every copy (system and user folder), keeps other plug-ins and same-named
+    /// bundles of someone else, and forgets the plug-in in installed.json.
+    #[cfg(unix)]
+    #[test]
+    fn remove_offline_mac_way() {
+        let _turn = JOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = scratch("remove");
+        let env = env_in(&base);
+        let sys_au = env.system_root.join("Components/V.component");
+        let user_vst = env.user_root.join("VST3/V.vst3");
+        let other = env.user_root.join("Components/Other.component");
+        let foreign = env.system_root.join("VST3/V.vst3"); // same file name, someone else's plug-in
+        make_bundle(&sys_au, "com.mystudio.comp165", "0.1.0");
+        make_bundle(&user_vst, "com.mystudio.comp165", "0.1.0");
+        make_bundle(&other, "com.mystudio.rider", "0.1.0");
+        make_bundle(&foreign, "com.someone.else", "1.0.0");
+        record(&env, "reckys-velvet", "0.1.0", Location::System, &[&sys_au]);
+        record(&env, "reckys-rider", "0.1.0", Location::User, &[&other]);
+
+        let q = velvet_query("V.component", "V.vst3");
+        let r = remove(&env, &q).unwrap();
+        assert_eq!(r.removed, vec!["reckys-velvet".to_string()]);
+        assert_eq!(r.paths.len(), 2);
+        assert!(!sys_au.exists() && !user_vst.exists());
+        assert!(other.exists(), "another plug-in stays");
+        assert!(foreign.exists(), "a different plug-in with the same file name stays");
+        let file = read_installed(&env);
+        assert!(!file.plugins.contains_key("reckys-velvet") && file.plugins.contains_key("reckys-rider"));
+        assert!(get_installed(&env, &q).is_empty());
+        // nothing left to remove: fine, nothing happens
+        assert_eq!(remove(&env, &q).unwrap(), RemoveResult { removed: vec![], paths: vec![] });
+        // no temporary folders left
+        assert_eq!(fs::read_dir(&env.temp_dir).map(|d| d.count()).unwrap_or(0), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The remove script is all-or-nothing: if the second bundle cannot be moved away, the first is put back.
+    #[cfg(unix)]
+    #[test]
+    fn remove_script_rolls_back() {
+        let base = scratch("remove-script");
+        let a = base.join("Plug-Ins/Components/A.component");
+        let b = base.join("Plug-Ins/VST3/A.vst3");
+        make_bundle(&a, "x", "0.1.0");
+        make_bundle(&b, "x", "0.1.0");
+        let backup = base.join("work/removed");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("1-A.vst3"), b"in the way").unwrap(); // mv of a folder onto a file fails
+        let script = base.join("work/remove.sh");
+        fs::write(&script, remove_script(&[a.clone(), b.clone()], &backup)).unwrap();
+        let r = run_script(&script, false, "", "Removing failed", "Nothing was removed from that folder.");
+        assert!(matches!(r, Err(InstallError::Failed(ref m)) if m.contains("Removing failed")), "{r:?}");
+        assert!(a.join("Contents/Info.plist").exists(), "first bundle put back");
+        assert!(b.join("Contents/Info.plist").exists());
+        fs::remove_file(backup.join("1-A.vst3")).unwrap();
+        run_script(&script, false, "", "Removing failed", "").unwrap();
+        assert!(!a.exists() && !b.exists() && !backup.exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Windows way: rename to ".central-old", then delete; one that cannot be renamed puts the others back.
+    #[cfg(unix)]
+    #[test]
+    fn remove_bundles_windows_way() {
+        let _turn = JOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = scratch("remove-win");
+        let vst3 = base.join("Common Files/VST3");
+        let a = vst3.join("A.vst3");
+        make_win_bundle(&a, "0.1.0", "4D737464");
+        // a name so long that "<name>.central-old" is too long for the file system: the rename fails
+        let long = vst3.join(format!("{}.vst3", "L".repeat(240)));
+        make_win_bundle(&long, "0.1.0", "4D737464");
+        let r = remove_bundles(&[a.clone(), long.clone()]);
+        assert!(matches!(r, Err(ref m) if m.contains("DAW open")), "{r:?}");
+        assert!(a.join("Contents/Resources/moduleinfo.json").exists(), "first bundle renamed back");
+        assert!(!vst3.join("A.vst3.central-old").exists());
+        remove_bundles(&[a.clone(), vst3.join("Missing.vst3")]).unwrap();
+        assert!(!a.exists() && !vst3.join("A.vst3.central-old").exists());
+
+        // whole remove() the Windows way (user folder, no UAC in tests)
+        let env = Env { native_copy: true, ..env_in(&base) };
+        let user_vst = env.user_root.join("VST3/V.vst3");
+        make_win_bundle(&user_vst, "0.1.0", "4D737464");
+        let mut names = BTreeMap::new();
+        names.insert("vst3".to_string(), "V.vst3".to_string());
+        let q = vec![PluginQuery { id: "reckys-velvet".into(), bundle_names: names, bundle_id: None, name: None }];
+        assert_eq!(remove(&env, &q).unwrap().removed, vec!["reckys-velvet".to_string()]);
+        assert!(!user_vst.exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// "Update all": two plug-ins, one for the system folder and one for the user's folder, copied in one job and
+    /// both noted in installed.json.
+    #[cfg(unix)]
+    #[test]
+    fn several_plugins_in_one_job() {
+        let base = scratch("batch");
+        let env = env_in(&base);
+        let work = base.join("work");
+        let mut reqs = Vec::new();
+        let mut zips = Vec::new();
+        for (i, (id, bundle_id, loc)) in [("reckys-velvet", "com.mystudio.comp165", Location::System), ("reckys-rider", "com.mystudio.reckysrider", Location::User)]
+            .into_iter()
+            .enumerate()
+        {
+            let pl = info_plist(bundle_id, "0.2.0");
+            let name = format!("P{i}.component");
+            let data = zip_of(&[(&format!("{name}/Contents/Info.plist"), &pl, 0o644)]);
+            let mut names = BTreeMap::new();
+            names.insert("au".to_string(), name.clone());
+            reqs.push(InstallRequest {
+                plugin_id: id.into(),
+                plugin_name: id.into(),
+                version: "0.2.0".into(),
+                url: format!("{DOWNLOAD_PREFIX}{id}/x.zip"),
+                sha256: hex(&Sha256::digest(&data)),
+                size: data.len() as u64,
+                bundle_names: names,
+                bundle_id: Some(bundle_id.into()),
+                formats: vec!["au".into()],
+                location: loc,
+            });
+            zips.push(data);
+        }
+        // an older Velvet is in the system folder already
+        make_bundle(&env.system_root.join("Components/P0.component"), "com.mystudio.comp165", "0.1.0");
+        let mut prepared = Vec::new();
+        for (i, (req, data)) in reqs.iter().zip(&zips).enumerate() {
+            let dir = work.join(i.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("download.zip"), data).unwrap();
+            let checked = check_request(req).unwrap();
+            prepared.push(prepare(&env, req, &checked, &dir, &dir.join("download.zip"), &req.sha256, &|_, _, _| {}).unwrap());
+        }
+        let seen = std::cell::RefCell::new(Vec::new());
+        let r = place(&env, &prepared, &work, &|id, ph, _, _| seen.borrow_mut().push(format!("{id}:{ph}"))).unwrap();
+        assert!(r.failed.is_empty());
+        assert_eq!(r.installed.len(), 2);
+        assert_eq!(bundle_info(&env.system_root.join("Components/P0.component")).version.as_deref(), Some("0.2.0"));
+        assert_eq!(bundle_info(&env.user_root.join("Components/P1.component")).version.as_deref(), Some("0.2.0"));
+        let file = read_installed(&env);
+        assert_eq!(file.plugins["reckys-velvet"].location, Location::System);
+        assert_eq!(file.plugins["reckys-rider"].location, Location::User);
+        assert!(seen.borrow().contains(&"reckys-velvet:done".to_string()) && seen.borrow().contains(&"reckys-rider:done".to_string()));
+        fs::remove_dir_all(&base).unwrap();
     }
 }

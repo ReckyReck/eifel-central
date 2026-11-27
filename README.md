@@ -29,23 +29,25 @@ Only needed the first time.
 
 ## Versions
 
-Current: **0.3.0** (alpha). Alpha numbers 0.MINOR.PATCH: PATCH = fixes only, MINOR = new features or look.
-Version lives in three files and must match: `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `package.json`.
+Current: **0.4.0** (alpha). Alpha numbers 0.MINOR.PATCH: PATCH = fixes only, MINOR = new features or look.
+Version lives in three files and must match: `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `package.json`
+(plus the fallback in `src/main.ts`).
 
 | Version | Date | What changed |
 | --- | --- | --- |
 | 0.1.0 | 24 Nov 2026 | Catalog window: rack units, filters, search, settings (step 5) |
 | 0.2.0 | 25 Nov 2026 | INSTALL works on the Mac (step 6); test releases for testers |
 | 0.3.0 | 27 Nov 2026 | INSTALL works on Windows (VST3, one UAC prompt, step 8); test release carries the Windows Setup too |
+| 0.4.0 | 28 Nov 2026 | Step 7: UPDATE (with what's new), UPDATE ALL (one password prompt), OPTIONS ▾ (what's new, reinstall, remove), UNINSTALL ALL, DAW check. SEND FEEDBACK ▾ in the header and "Report a bug" / "Request a feature" in every plug-in's OPTIONS |
 
 ## Status
 
 | Step | What | State |
 | --- | --- | --- |
 | 5 | App window: catalog, filters, search, settings (design from the plug-ins) | done (0.1.0) |
-| 6 | Install on the Mac: download, SHA-256, password prompt, `installed.json` | 0.2.0 – in test |
-| 7 | Update, remove, DAW check, "uninstall all" | next (Mac and Windows) |
-| 8 | Windows: install VST3 with one UAC prompt, recognise installed copies | **this build (0.3.0)** – in test |
+| 6 | Install on the Mac: download, SHA-256, password prompt, `installed.json` | done (0.2.0) |
+| 7 | Update, remove, DAW check, "uninstall all" (Mac and Windows) + "Send feedback" | **this build (0.4.0)** – in test |
+| 8 | Windows: install VST3 with one UAC prompt, recognise installed copies | 0.3.0 – in test |
 | 9 | Self-update (signed updates) | |
 
 ## What INSTALL does (Mac, 0.2.0)
@@ -66,7 +68,6 @@ Version lives in three files and must match: `src-tauri/tauri.conf.json`, `src-t
 
 Safeguard: a plug-in found in the plug-in folders that Central did not install (or that changed since) shows
 **INSTALLED (NOT BY CENTRAL)**; its button is **REPLACE…** and asks first. Central removes no quarantine flags.
-UPDATE, OPTIONS (reinstall/remove), UPDATE ALL and UNINSTALL ALL still show a "next build" note (step 7).
 
 Checks: `cd src-tauri && cargo test` (offline tests: request checks, safe unpacking, copy with rollback, the whole
 install into a scratch folder, recognising installed copies; the Windows way – moduleinfo.json, copy with rollback,
@@ -95,19 +96,56 @@ Checks on Windows: "Build app" runs `cargo test -- --include-ignored` on GitHub'
 tests, a real "Run as administrator" round trip, and download + SHA-256 + unpack of every Windows plug-in of the live
 catalog (version and maker code checked, nothing installed).
 
+## Update, remove, DAW check (step 7, 0.4.0)
+
+* **UPDATE** opens a dialog with the new version's notes (catalog changelog), then installs it **where the old copy
+  is, with the formats it has** (so no old copy is left behind). If anything fails, the old copy is put back.
+* **UPDATE ALL** (header): one dialog for every plug-in with an update. Central downloads and checks them one after
+  the other, then copies all of them with **one** password prompt (Mac) / **one** UAC prompt (Windows). A plug-in
+  whose download fails is left out and shown with a red LED chain (hover for the reason); the others still go
+  ahead. CANCEL or a cancelled prompt changes nothing.
+* **OPTIONS ▾** on every plug-in: *What's new in x.y.z*, *Reinstall* (same version again, same place), *Remove…*,
+  *Report a bug*, *Request a feature*. For plug-ins that are not installed or need an update, OPTIONS is the small
+  key under the main button.
+* **Remove…** lists the exact files first. It deletes every copy of the plug-in in both plug-in folders (also copies
+  Central did not install - the dialog says so) and nothing else: Central finds them with the same check as for
+  "installed" (Mac: bundle id; Windows: maker code Mstd). All-or-nothing: the bundles are moved aside first and put
+  back if one cannot be moved. Mac: one password prompt for the system folder. Windows: the same administrator
+  helper as INSTALL (`--copy-plugins <plan.json>`, now also with a "remove" list, only bundles directly in
+  `Common Files\VST3`). `installed.json` forgets the plug-in.
+* **Settings > Uninstall all**: the same for every installed plug-in, one prompt for all.
+* **DAW check**: the footer shows "No DAW open" or "Open: Logic Pro" (checked every 5 seconds: Mac `ps`, Windows
+  `tasklist`; Logic, MainStage, GarageBand, Live, Cubase, Nuendo, WaveLab, Studio One, REAPER, Bitwig, Pro Tools,
+  FL Studio, Reason, DP, LUNA, Waveform, Ardour, Mixbus, Audition). The Update / Replace / Remove dialogs warn when a
+  DAW is open. It is a warning, not a lock: on Windows a plug-in the DAW has loaded cannot be replaced (Central then
+  says "is your DAW open?" and keeps the old copy).
+
+## Send feedback (0.4.0)
+
+* Header key **SEND FEEDBACK ▾**: *Report a bug*, *Feature request*, *Idea* - about Central itself.
+  Every plug-in's **OPTIONS ▾**: *Report a bug*, *Request a feature* - about that plug-in.
+* Central only opens a web address in the default browser: a new issue form in the private repo
+  `ReckyReck/eifel-feedback` (GitHub Issue forms, spec in the project note plan-Central-feedback.md). No token, no
+  server, no GitHub API. Filled in: title (`[Bug] Recky's Rider 0.1.0: `), labels (`type: bug,status: new,plugin:
+  reckys-rider`, or `app: central`), version, and for bugs the system (`macOS 26.1 (Apple Silicon)` /
+  `Windows 11 26100.2314 (x64)` / `(ARM)`). Dropdowns cannot be pre-selected by GitHub; the tester picks them.
+* Security: the window has no permission to open web pages. The Rust command `open_feedback` opens only addresses
+  starting with `https://github.com/ReckyReck/eifel-feedback/issues/new` (URL-encoded, at most 6000 characters).
+* The repo is private (invited testers only). **Before any public release, hide or change these links.**
+
 ## Test release for testers
 
 github.com > eifel-central > Actions > "Build app" > Run workflow, tick **Publish a test release**. When it is green,
-the app is at <https://github.com/ReckyReck/eifel-central/releases> (pre-release `central-v0.3.0`, with the Mac
+the app is at <https://github.com/ReckyReck/eifel-central/releases> (pre-release `central-v0.4.0`, with the Mac
 `.dmg` and the Windows `_x64-setup.exe`); testers need no GitHub account. A version can only be published once – raise it for the next test build.
 
 ## Project layout
 
 | Path | What it is |
 | --- | --- |
-| `src/` | The window's code (TypeScript, no framework): `catalog.ts` (load + check catalog.json), `state.ts` (settings, "new", installed), `install.ts` (starts an install, follows its progress), `view.ts` (the rack units), `i18n/en.ts` (all texts) |
+| `src/` | The window's code (TypeScript, no framework): `catalog.ts` (load + check catalog.json), `state.ts` (settings, "new", installed), `install.ts` (install / update all / remove, follows the progress), `feedback.ts` (feedback form addresses), `computer.ts` (DAW check, system), `view.ts` (rack units, menus, dialogs), `i18n/en.ts` (all texts) |
 | `ui/` | What the window loads: `index.html`, `css/central.css` (colour tokens from the plug-ins), `fonts/` (Inter, OFL licence), `js/` (built from `src/`) |
-| `src-tauri/` | The app shell (Tauri 2, Rust): `src/main.rs` (commands for the window), `src/installer.rs` (download, checksum, unpack, copy, installed.json + tests), `tauri.conf.json` (window, security rules, bundles), `icons/` |
+| `src-tauri/` | The app shell (Tauri 2, Rust): `src/main.rs` (commands for the window), `src/installer.rs` (download, checksum, unpack, copy, remove, installed.json + tests), `src/system.rs` (DAW check, system text, feedback address check + tests), `tauri.conf.json` (window, security rules, bundles), `icons/` |
 | `.github/workflows/build-app.yml` | Builds the Mac `.dmg` and the Windows installer on GitHub |
 
 Build: github.com > eifel-central > Actions > "Build app" > Run workflow. Texts: all in `src/i18n/en.ts`
