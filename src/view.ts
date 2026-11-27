@@ -192,7 +192,7 @@ function phaseText(job: Job): string {
     case "unpack":
       return t("phase.unpack");
     case "password":
-      return t("phase.password");
+      return t(PLATFORM === "windows" ? "phase.passwordWin" : "phase.password");
     case "copy":
       return t("phase.copy");
     case "done":
@@ -369,7 +369,8 @@ function replacePanel(s: ViewState, a: Actions): HTMLElement | null {
   if (!v || !v.installed) return null;
   const p = v.plugin;
   const formats = formatsToInstall(p, s.settings).map((f) => f.toUpperCase()).join(", ");
-  const location = t(s.settings.location === "user" ? "location.user" : "location.system");
+  const where = (l: Settings["location"]) => t(`location.${l}${PLATFORM === "windows" ? "Win" : ""}` as const);
+  const location = where(s.settings.location);
   const found = v.installed.location;
   const elsewhere = found !== null && found !== s.settings.location;
   const cancel = () => a.answerReplace(false);
@@ -383,7 +384,7 @@ function replacePanel(s: ViewState, a: Actions): HTMLElement | null {
       h("h2", { class: "modal-title" }, t("replace.title", { name: p.name })),
       h("p", {}, t("replace.found", { name: p.name, version: v.installed.version })),
       h("p", {}, t("replace.will", { version: p.latest.version, formats, location })),
-      elsewhere ? h("p", { class: "warn" }, led("amber"), h("span", {}, t("replace.otherPlace", { found: t(found === "user" ? "location.user" : "location.system"), location }))) : null,
+      elsewhere ? h("p", { class: "warn" }, led("amber"), h("span", {}, t("replace.otherPlace", { found: where(found ?? "system"), location }))) : null,
       h(
         "div",
         { class: "row modal-foot" },

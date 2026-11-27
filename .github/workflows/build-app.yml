@@ -3,8 +3,9 @@
 # When it is finished (about 10-20 minutes), the downloads are at the bottom of the run's page, under "Artifacts".
 # If the Mac job waits forever ("capacity constraints"): Run workflow again and pick "Intel Mac" - GitHub is often
 # short of Apple Silicon Macs. The result is the same universal app (Apple Silicon + Intel).
-# Tick "Publish a test release" to put the Mac app on github.com/ReckyReck/eifel-central/releases as a pre-release
-# "central-vX.Y.Z" (X.Y.Z = version in src-tauri/tauri.conf.json): testers download it there without a GitHub account.
+# Tick "Publish a test release" to put the Mac app (.dmg) and the Windows Setup (.exe) on
+# github.com/ReckyReck/eifel-central/releases as a pre-release "central-vX.Y.Z" (X.Y.Z = version in
+# src-tauri/tauri.conf.json): testers download it there without a GitHub account.
 # A version can be published only once - raise the version for the next test build.
 # (Later, step 9: releases will also carry the self-update files.)
 name: Build app
@@ -20,7 +21,7 @@ on:
           - "Apple Silicon Mac (macos-15)"
           - "Intel Mac (macos-15-intel)"
       publish:
-        description: "Publish a test release (Mac app, pre-release) for testers"
+        description: "Publish a test release (Mac app + Windows Setup, pre-release) for testers"
         type: boolean
         default: false
 
@@ -84,6 +85,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test --manifest-path src-tauri/Cargo.toml -- --include-ignored --nocapture
 
+      - name: Test the installer (offline tests + download and unpack every Windows plug-in of the live catalog, no install; Run as administrator)
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --include-ignored --nocapture
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -105,6 +110,11 @@ jobs:
           name: Eifel-Mastering-Central-Mac
           path: dist
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: Eifel-Mastering-Central-Windows
+          path: dist
+
       - name: Create the pre-release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -116,15 +126,24 @@ jobs:
             exit 1
           fi
           cat > notes.md <<NOTES
-          Test build of Eifel Mastering Central $VERSION (alpha) for Mac (Apple Silicon and Intel).
+          Test build of Eifel Mastering Central $VERSION (alpha) for Mac (Apple Silicon and Intel) and Windows 10 / 11 (64-bit).
 
-          **First start**
+          **Mac - first start**
           1. Download the .dmg below, open it and drag **Eifel Mastering Central** into **Applications**.
           2. Open the app. macOS says it cannot check it: click **Done**.
           3. System Settings > Privacy & Security: scroll down, click **Open Anyway** next to Eifel Mastering Central, enter your password.
 
+          **Windows - first start**
+          1. Download the **_x64-setup.exe** below and open it.
+          2. If Windows says "Windows protected your PC": click **More info**, then **Run anyway** (the app is not signed yet).
+          3. Install it (no administrator needed for Central itself) and open Eifel Mastering Central.
+          4. INSTALL puts the plug-in into C:\Program Files\Common Files\VST3. Windows asks once per install
+             ("Do you want to allow this app to make changes?", Eifel Mastering Central, unknown publisher): click **Yes**.
+          5. Start your DAW (Cubase scans new plug-ins at start).
+
           See the README for what this build can do.
           NOTES
-          gh release create "$TAG" dist/*.dmg --prerelease --target "$GITHUB_SHA" \
+          ls -la dist
+          gh release create "$TAG" dist/*.dmg dist/*.exe --prerelease --target "$GITHUB_SHA" \
             --title "Eifel Mastering Central $VERSION (test)" --notes-file notes.md
           echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"

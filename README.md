@@ -24,25 +24,28 @@ Only needed the first time.
 **Windows 10 / 11**
 1. Run the downloaded `Eifel Mastering Central_…_x64-setup.exe`.
 2. If SmartScreen says "Windows protected your PC": click **More info**, then **Run anyway**.
+3. Central itself installs without administrator rights. Installing a plug-in asks once per install
+   ("Do you want to allow this app to make changes?" – Eifel Mastering Central, unknown publisher): click **Yes**.
 
 ## Versions
 
-Current: **0.2.0** (alpha). Alpha numbers 0.MINOR.PATCH: PATCH = fixes only, MINOR = new features or look.
+Current: **0.3.0** (alpha). Alpha numbers 0.MINOR.PATCH: PATCH = fixes only, MINOR = new features or look.
 Version lives in three files and must match: `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `package.json`.
 
 | Version | Date | What changed |
 | --- | --- | --- |
 | 0.1.0 | 24 Nov 2026 | Catalog window: rack units, filters, search, settings (step 5) |
 | 0.2.0 | 25 Nov 2026 | INSTALL works on the Mac (step 6); test releases for testers |
+| 0.3.0 | 27 Nov 2026 | INSTALL works on Windows (VST3, one UAC prompt, step 8); test release carries the Windows Setup too |
 
 ## Status
 
 | Step | What | State |
 | --- | --- | --- |
 | 5 | App window: catalog, filters, search, settings (design from the plug-ins) | done (0.1.0) |
-| 6 | Install on the Mac: download, SHA-256, password prompt, `installed.json` | **this build (0.2.0)** – in test |
-| 7 | Update, remove, DAW check, "uninstall all" | next |
-| 8 | Windows (UAC helper) | |
+| 6 | Install on the Mac: download, SHA-256, password prompt, `installed.json` | 0.2.0 – in test |
+| 7 | Update, remove, DAW check, "uninstall all" | next (Mac and Windows) |
+| 8 | Windows: install VST3 with one UAC prompt, recognise installed copies | **this build (0.3.0)** – in test |
 | 9 | Self-update (signed updates) | |
 
 ## What INSTALL does (Mac, 0.2.0)
@@ -66,14 +69,37 @@ Safeguard: a plug-in found in the plug-in folders that Central did not install (
 UPDATE, OPTIONS (reinstall/remove), UPDATE ALL and UNINSTALL ALL still show a "next build" note (step 7).
 
 Checks: `cd src-tauri && cargo test` (offline tests: request checks, safe unpacking, copy with rollback, the whole
-install into a scratch folder, recognising installed copies). "Build app" also runs the ignored test on GitHub's Mac:
+install into a scratch folder, recognising installed copies; the Windows way – moduleinfo.json, copy with rollback,
+the administrator helper's plan check – runs on every computer). "Build app" also runs the ignored test on GitHub's Mac:
 it downloads every Mac plug-in of the live catalog, checks its SHA-256, unpacks it and verifies the code signature.
+
+## What INSTALL does (Windows, 0.3.0)
+
+Same checks as on the Mac (address, size, SHA-256, safe unpacking). Then:
+1. The download must contain `<Name>.vst3` (a folder with `Contents/x86_64-win/<Name>.vst3` and
+   `Contents/Resources/moduleinfo.json`). Windows VST3 bundles have no Info.plist: Central reads the **version**
+   from moduleinfo.json and checks that the plug-in's class id carries Recky's maker code **Mstd**.
+2. Copies it into `C:\Program Files\Common Files\VST3` – the folder every Windows DAW (Cubase/Nuendo included)
+   scans. For that Central starts itself once more "as administrator" (`--copy-plugins <plan.json>`): **one** UAC
+   prompt per install. That helper copies only bundles named in the plan, only into that VST3 folder.
+   An older copy is renamed to `<Name>.vst3.central-old` first and renamed back if anything fails. If the old copy
+   cannot be moved (a DAW has it open), Central says so: close the DAW and try again.
+3. Notes the install in `%APPDATA%\com.mystudio.central\installed.json`.
+4. No "Only my user" choice on Windows: the per-user VST3 folder (`%LOCALAPPDATA%\Programs\Common\VST3`) is in
+   Steinberg's VST3 rules, but not every DAW scans it and Cubase cannot add VST3 folders. Central still recognises
+   copies found there.
+5. Unsigned app: SmartScreen asks once at the first start (More info > Run anyway); a code-signing certificate
+   would remove that (costs money, not planned).
+
+Checks on Windows: "Build app" runs `cargo test -- --include-ignored` on GitHub's Windows computer too: offline
+tests, a real "Run as administrator" round trip, and download + SHA-256 + unpack of every Windows plug-in of the live
+catalog (version and maker code checked, nothing installed).
 
 ## Test release for testers
 
 github.com > eifel-central > Actions > "Build app" > Run workflow, tick **Publish a test release**. When it is green,
-the app is at <https://github.com/ReckyReck/eifel-central/releases> (pre-release `central-v0.2.0`); testers need no
-GitHub account. A version can only be published once – raise it for the next test build.
+the app is at <https://github.com/ReckyReck/eifel-central/releases> (pre-release `central-v0.3.0`, with the Mac
+`.dmg` and the Windows `_x64-setup.exe`); testers need no GitHub account. A version can only be published once – raise it for the next test build.
 
 ## Project layout
 

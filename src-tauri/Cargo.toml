@@ -1,6 +1,6 @@
 [package]
 name = "eifel-central"
-version = "0.2.0"
+version = "0.3.0"
 description = "Eifel Mastering Central - installs and updates Recky's plug-ins"
 authors = ["Eifel Mastering"]
 edition = "2021"

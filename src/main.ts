@@ -19,7 +19,7 @@ const state: ViewState = {
   search: "",
   settings: loadSettings(),
   settingsOpen: false,
-  appVersion: "0.2.0",
+  appVersion: "0.3.0",
   now: Date.now(),
   job: null,
   confirm: null,
@@ -54,7 +54,6 @@ const actions: Actions = {
     toast(t("toast.notYet"));
   },
   install(v) {
-    if (PLATFORM !== "macos") return toast(t("toast.windowsLater"));
     if (state.job && !["done", "error"].includes(state.job.phase)) return toast(t("toast.busy"));
     if (!formatsToInstall(v.plugin, state.settings).length) return toast(t("toast.noFormats"));
     // Safeguard: a copy that Central did not install is only replaced after asking.

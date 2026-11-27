@@ -80,7 +80,8 @@ export interface InstalledEntry {
 
 /**
  * What is installed, by plug-in id. Comes from the app's Rust side ("get_installed": reads installed.json and the
- * bundles' Info.plist in /Library/Audio/Plug-Ins and ~/Library/Audio/Plug-Ins). Outside the app: nothing.
+ * bundles' Info.plist in /Library/Audio/Plug-Ins and ~/Library/Audio/Plug-Ins; on Windows the VST3 moduleinfo.json in
+ * C:\Program Files\Common Files\VST3 and %LOCALAPPDATA%\Programs\Common\VST3). Outside the app: nothing.
  */
 export async function loadInstalled(catalog: Plugin[]): Promise<Map<string, InstalledEntry>> {
   const invoke = window.__TAURI__?.core.invoke;
