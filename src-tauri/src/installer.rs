@@ -879,7 +879,11 @@ fn ps_quote(s: &str) -> String {
 /// its exit code. A declined prompt is recognised by the Windows error number 1223, not by the (translated) text.
 #[cfg_attr(not(windows), allow(dead_code))] // used by run_elevated (Windows only)
 pub fn elevate_command(exe: &Path, args: &[String]) -> String {
-    let list: Vec<String> = args.iter().map(|a| ps_quote(&format!("\"{a}\""))).collect();
+    // Start-Process joins the list with spaces: only arguments with spaces (or empty ones) get double quotes.
+    let list: Vec<String> = args
+        .iter()
+        .map(|a| ps_quote(&if a.is_empty() || a.contains(char::is_whitespace) { format!("\"{a}\"") } else { a.clone() }))
+        .collect();
     format!(
         "$ErrorActionPreference = 'Stop'; try {{ $p = Start-Process -FilePath {} -ArgumentList @({}) -Verb RunAs \
          -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode }} catch {{ $e = $_.Exception; \
@@ -1215,6 +1219,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     fn items_for(env: &Env, work: &Path, names: &[(Format, &str)], loc: Location) -> Vec<CopyItem> {
         names
             .iter()
@@ -1661,10 +1666,11 @@ mod tests {
         assert_eq!(ps_quote("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
         let cmd = elevate_command(
             Path::new(r"C:\Users\Jürgen\AppData\Local\Eifel Mastering Central\Eifel Mastering Central.exe"),
-            &["--copy-plugins".into(), r"C:\Users\Jürgen\AppData\Local\Temp\eifel-central-x\plan.json".into()],
+            &["--copy-plugins".into(), r"C:\Users\Jürgen Ö\AppData\Local\Temp\eifel-central-x\plan.json".into()],
         );
         assert!(cmd.contains(r"-FilePath 'C:\Users\Jürgen\AppData\Local\Eifel Mastering Central\Eifel Mastering Central.exe'"), "{cmd}");
-        assert!(cmd.contains(r#"-ArgumentList @('"--copy-plugins"','"C:\Users\Jürgen\AppData\Local\Temp\eifel-central-x\plan.json"')"#), "{cmd}");
+        assert!(cmd.contains(r#"-ArgumentList @('--copy-plugins','"C:\Users\Jürgen Ö\AppData\Local\Temp\eifel-central-x\plan.json"')"#), "{cmd}");
+        assert!(elevate_command(Path::new("cmd.exe"), &["/c".into(), "exit".into(), "7".into()]).contains("-ArgumentList @('/c','exit','7')"));
         assert!(cmd.contains("-Verb RunAs") && cmd.contains("NativeErrorCode -eq 1223"));
     }
 
